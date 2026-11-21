@@ -1,28 +1,42 @@
-import os
 import re
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import json
-import random
 import pandas as pd
 
 from .utils.pdf import extract_text_from_pdf
-from .utils.config import get_prompt
-from .llm_clients.openai_client import OpenAIClient
-from .llm_clients.anthropic_client import AnthropicClient
-from .llm_clients.google_client import GoogleClient
-from .llm_clients.deepseek_client import DeepSeekClient
-from .llm_clients.llama_client import LlamaClient
+from .utils.config import (
+    get_prompt,
+    get_local_models,
+    get_local_server_config,
+    get_meta_reviewer_config,
+)
+from .llm_clients.local_client import LocalLLMClient
+
+
+def _build_local_client(cfg: Dict, config_file: Optional[str] = None) -> LocalLLMClient:
+    """Build a LocalLLMClient from a config entry, inheriting local_server
+    defaults for any field the entry leaves as ``None`` (or omits)."""
+    server = get_local_server_config(config_file)
+    base_url = cfg.get("base_url") or server.get("base_url") or "http://localhost:11434/v1"
+    api_key = cfg.get("api_key") or server.get("api_key") or "local"
+    return LocalLLMClient(
+        model=cfg["model"],
+        base_url=base_url,
+        api_key=api_key,
+        temperature=cfg.get("temperature", 0.1),
+        max_tokens=cfg.get("max_tokens", 8000),
+    )
 
 
 def get_review_prompt(paper_text: str, config_file: Optional[str] = None) -> str:
     """
     Generate the prompt for peer review.
-    
+
     Args:
         paper_text: The text of the paper to review
         config_file: Optional path to a custom config file
-    
+
     Returns:
         The formatted prompt string
     """
@@ -37,30 +51,30 @@ def get_review_prompt(paper_text: str, config_file: Optional[str] = None) -> str
             "a detailed point-by-point analysis of any flaws in the study.\n\n"
             "Here is the paper to review:\n\n{paper_text}"
         )
-    
+
     return prompt_template.format(paper_text=paper_text)
 
 
 def get_metareview_prompt(reviews: List[str], config_file: Optional[str] = None) -> str:
     """
     Generate the prompt for meta-review.
-    
+
     Args:
         reviews: List of review texts
         config_file: Optional path to a custom config file
-        
+
     Returns:
         The formatted meta-review prompt
     """
     # NATO phonetic alphabet for reviewers
     nato_names = ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
-    
+
     # Build reviews text with NATO phonetic names
     reviews_text = ""
     for i, review in enumerate(reviews):
         reviewer_name = nato_names[i] if i < len(nato_names) else f"reviewer_{i+1}"
         reviews_text += f"Review from {reviewer_name}:\n\n{review}\n\n"
-    
+
     # Get prompt template from config
     prompt_template = get_prompt("metareview", config_file)
     if not prompt_template:
@@ -90,46 +104,59 @@ def get_metareview_prompt(reviews: List[str], config_file: Optional[str] = None)
             "(e.g., alfa, bravo, charlie) throughout your meta-review.\n\n"
             "{reviews_text}"
         )
-    
+
     return prompt_template.format(reviews_text=reviews_text)
+
+
+def get_client_factories(config_file: Optional[str] = None) -> Dict[str, callable]:
+    """Build a {reviewer_name: client_factory} mapping from the configured
+    local models. Each factory is only instantiated on demand (so unused
+    reviewers never open a connection)."""
+    models = get_local_models(config_file)
+    return {
+        name: (lambda cfg=cfg: _build_local_client(cfg, config_file))
+        for name, cfg in models.items()
+    }
+
+
+def get_meta_reviewer_client(config_file: Optional[str] = None) -> LocalLLMClient:
+    """Build the LocalLLMClient used for the meta-review and the
+    concerns-extraction JSON call. Driven by the ``meta_reviewer`` config
+    section so the meta-reviewer can be a different (stronger / longer-context)
+    model than the individual reviewers."""
+    return _build_local_client(get_meta_reviewer_config(config_file), config_file)
 
 
 def process_paper(pdf_path: str, models: List[str], config_file: Optional[str] = None) -> Dict[str, str]:
     """
-    Process a paper and generate reviews using multiple LLMs.
-    
+    Process a paper and generate reviews using multiple local LLMs.
+
     Args:
         pdf_path: Path to the PDF file to process
-        models: List of model names to use for reviews
+        models: List of reviewer names (keys of ``local_models`` in the config)
+            to use for reviews
         config_file: Optional path to a custom config file
-        
+
     Returns:
-        Dictionary mapping model names to their review texts
+        Dictionary mapping reviewer names to their review texts
     """
     # Extract text from PDF
     paper_text = extract_text_from_pdf(pdf_path)
-    
+
     # Generate the review prompt
     prompt = get_review_prompt(paper_text, config_file)
-    
-    # Define client factories for each model
-    client_factories = {
-        "gpt4-o1": lambda: OpenAIClient(model="gpt-4o"),
-        "gpt4-o3-mini": lambda: OpenAIClient(model="gpt-4o-mini"),
-        "claude-3.7-sonnet": lambda: AnthropicClient(model="claude-3-sonnet-20240229"),
-        "gemini-2.5-pro": lambda: GoogleClient(model="gemini-2.5-pro-preview-05-06"),
-        "deepseek-r1": lambda: DeepSeekClient(model="deepseek-r1"),
-        "llama-4-maverick": lambda: LlamaClient(model="llama-4-maverick")
-    }
-    
-    # Get reviews from each LLM
+
+    # Build client factories from the configured local models
+    client_factories = get_client_factories(config_file)
+
+    # Get reviews from each requested local LLM
     reviews = {}
     for model_name in models:
         if model_name in client_factories:
             # Only initialize the client if the model is requested
             client = client_factories[model_name]()
             reviews[model_name] = client.generate(prompt)
-    
+
     return reviews
 
 
@@ -138,17 +165,17 @@ def extract_concerns_table(meta_review_text: str) -> Optional[Dict]:
     # Look for JSON data between CONCERNS_TABLE_DATA section and the end of a JSON block
     pattern = r'CONCERNS_TABLE_DATA.*?```json\s*(.*?)\s*```'
     match = re.search(pattern, meta_review_text, re.DOTALL)
-    
+
     if not match:
         # Try without the json tag in case the model formatted it differently
         pattern = r'CONCERNS_TABLE_DATA.*?```\s*(.*?)\s*```'
         match = re.search(pattern, meta_review_text, re.DOTALL)
-    
+
     if not match:
         # Try finding a JSON object with "concerns" key anywhere in the text
         pattern = r'\{\s*"concerns"\s*:\s*\[.*?\]\s*\}'
         match = re.search(pattern, meta_review_text, re.DOTALL)
-    
+
     if match:
         try:
             json_str = match.group(1)
@@ -163,54 +190,56 @@ def extract_concerns_table(meta_review_text: str) -> Optional[Dict]:
 
 def generate_meta_review(reviews: Dict[str, str], config_file: Optional[str] = None) -> Tuple[str, Dict[str, str]]:
     """
-    Generate a meta-review of all reviews.
-    
+    Generate a meta-review of all reviews using the configured local
+    meta-reviewer model.
+
     Args:
-        reviews: Dictionary mapping model names to their review texts
+        reviews: Dictionary mapping reviewer names to their review texts
         config_file: Optional path to a custom config file
-        
+
     Returns:
-        Tuple of (meta-review text, NATO-to-model mapping)
+        Tuple of (meta-review text, NATO-to-reviewer mapping)
     """
     # NATO phonetic alphabet for reviewers
     nato_names = ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
-    
-    # Get list of models in a fixed order
+
+    # Get list of reviewers in a fixed order
     models_list = list(reviews.keys())
-    
-    # Remove LLM identifiers but maintain order for mapping
+
+    # Remove reviewer identifiers but maintain order for mapping
     anonymized_reviews = [reviews[model] for model in models_list]
-    
-    # Create mapping of NATO name to model name
+
+    # Create mapping of NATO name to reviewer name
     nato_to_model = {nato_names[i]: model for i, model in enumerate(models_list) if i < len(nato_names)}
-    # Handle any extras if we have more than 10 models
+    # Handle any extras if we have more than 10 reviewers
     for i, model in enumerate(models_list[len(nato_names):], len(nato_names)):
         nato_to_model[f"reviewer_{i+1}"] = model
-    
+
     # Generate meta-review prompt
     prompt = get_metareview_prompt(anonymized_reviews, config_file)
-    
-    # Use Google Gemini for meta-review
-    meta_reviewer = GoogleClient(model="gemini-2.5-pro-preview-05-06")
+
+    # Use the configured local meta-reviewer (replaces the previous hardcoded
+    # Google Gemini client). No third-party API is contacted.
+    meta_reviewer = get_meta_reviewer_client(config_file)
     meta_review_text = meta_reviewer.generate(prompt)
-    
+
     # Filter out the CONCERNS_TABLE_DATA section from the meta-review
     clean_meta_review = re.sub(r'CONCERNS_TABLE_DATA.*', '', meta_review_text, flags=re.DOTALL)
-    
+
     return clean_meta_review, nato_to_model
 
 
 def save_concerns_as_csv(meta_review_text: str, output_path: Path) -> bool:
     """Extract concerns from meta-review and save as CSV."""
     concerns_data = extract_concerns_table(meta_review_text)
-    
+
     if not concerns_data or "concerns" not in concerns_data:
         print("No valid concerns table found in meta-review")
         return False
-    
+
     # Convert to DataFrame
     df = pd.DataFrame(concerns_data["concerns"])
-    
+
     # Save to CSV
     csv_path = output_path / "concerns_table.csv"
     df.to_csv(csv_path, index=False)

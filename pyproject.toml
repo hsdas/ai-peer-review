@@ -1,27 +1,19 @@
 [project]
 name = "ai-peer-review"
 version = "0.1.0"
-description = "AI-based peer review of academic papers"
+description = "AI-based peer review of academic papers using locally-served LLMs"
 readme = "README.md"
 authors = [
     { name = "Russell Poldrack", email = "poldrack@gmail.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "click",
-    "pydantic",
-    "requests",
     "pypdf",
-    "openai",
-    "anthropic",
-    "google-generativeai",
-    "tiktoken",
-    "tqdm",
-    "pytest>=8.3.5",
+    "openai>=1.0",
     "python-dotenv",
-    "structlog",
     "pandas",
-    "ipykernel>=6.29.5",
+    "pytest>=8.3.5",
 ]
 
 [project.scripts]

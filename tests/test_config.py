@@ -125,7 +125,16 @@ class TestConfig:
         # Check the structure of the default config
         assert "api_keys" in default_config
         assert "prompts" in default_config
-        
+
+        # Local-model sections (added when cloud API clients were replaced)
+        assert "local_server" in default_config
+        assert "base_url" in default_config["local_server"]
+        assert "local_models" in default_config
+        assert isinstance(default_config["local_models"], dict)
+        assert len(default_config["local_models"]) >= 1  # ships a default reviewer
+        assert "meta_reviewer" in default_config
+        assert "model" in default_config["meta_reviewer"]
+
         # Check that the prompts section contains expected prompts
         prompts = default_config["prompts"]
         assert "system" in prompts

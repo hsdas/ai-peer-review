@@ -1,12 +1,11 @@
 import pytest
 from unittest.mock import patch, MagicMock
-import random
 
 from ai_peer_review.review import (
     get_review_prompt,
     get_metareview_prompt,
     process_paper,
-    generate_meta_review
+    generate_meta_review,
 )
 
 
@@ -15,97 +14,108 @@ class TestReview:
         # Test with a sample paper text
         paper_text = "This is a sample paper about neuroscience."
         prompt = get_review_prompt(paper_text)
-        
+
         # Check that the prompt contains the paper text
         assert paper_text in prompt
-        
+
         # Check that the prompt contains the required instructions
         assert "neuroscientist and expert in brain imaging" in prompt
         assert "provide a thorough and critical review" in prompt
         assert "summary of the study" in prompt
         assert "point-by-point analysis" in prompt
-    
+
     def test_get_metareview_prompt(self):
         # Test with sample reviews
         reviews = ["Review 1 content", "Review 2 content"]
         prompt = get_metareview_prompt(reviews)
-        
+
         # Check that the prompt contains all reviews with NATO names
         assert "Review from alfa:\n\nReview 1 content" in prompt
         assert "Review from bravo:\n\nReview 2 content" in prompt
-        
+
         # Check that the prompt contains the required instructions
         assert "meta-review" in prompt
         assert "common points" in prompt
         assert "specific concerns" in prompt
         assert "CONCERNS_TABLE_DATA" in prompt
-    
+
+    @patch('ai_peer_review.review.get_client_factories')
     @patch('ai_peer_review.review.extract_text_from_pdf')
-    @patch('ai_peer_review.review.OpenAIClient')
-    @patch('ai_peer_review.review.AnthropicClient')
-    def test_process_paper(self, mock_anthropic, mock_openai, mock_extract_text):
-        # Mock the extract_text_from_pdf function
+    def test_process_paper(self, mock_extract_text, mock_get_factories):
+        # Mock PDF extraction
         mock_extract_text.return_value = "Paper content"
-        
-        # Mock the LLM clients
-        mock_openai_instance = MagicMock()
-        mock_openai_instance.generate.return_value = "OpenAI review"
-        mock_openai.return_value = mock_openai_instance
-        
-        mock_anthropic_instance = MagicMock()
-        mock_anthropic_instance.generate.return_value = "Anthropic review"
-        mock_anthropic.return_value = mock_anthropic_instance
-        
-        # Test with a subset of models
-        models = ["gpt4-o1", "claude-3.7-sonnet"]
+
+        # Mock the local client factory so no real server is contacted.
+        # One shared mock client backs both reviewers.
+        mock_client = MagicMock()
+        mock_client.generate.return_value = "Local review"
+        mock_factory = MagicMock(return_value=mock_client)
+        mock_get_factories.return_value = {
+            "reviewer-1": mock_factory,
+            "reviewer-2": mock_factory,
+        }
+
+        # Request a subset of the configured reviewers
+        models = ["reviewer-1", "reviewer-2"]
         reviews = process_paper("test.pdf", models)
-        
-        # Check that the extract_text_from_pdf function was called
+
+        # PDF text extraction ran once
         mock_extract_text.assert_called_once_with("test.pdf")
-        
-        # Check that the OpenAI client was initialized with the correct model
-        mock_openai.assert_called_once_with(model="gpt-4o")
-        
-        # Check that the Anthropic client was initialized with the correct model
-        mock_anthropic.assert_called_once_with(model="claude-3-sonnet-20240229")
-        
-        # Check that the generate methods were called
-        mock_openai_instance.generate.assert_called_once()
-        mock_anthropic_instance.generate.assert_called_once()
-        
-        # Check that the reviews dictionary contains the expected models
-        assert set(reviews.keys()) == {"gpt4-o1", "claude-3.7-sonnet"}
-        assert reviews["gpt4-o1"] == "OpenAI review"
-        assert reviews["claude-3.7-sonnet"] == "Anthropic review"
-    
-    @patch('ai_peer_review.review.GoogleClient')
-    @patch('ai_peer_review.review.random.shuffle')
-    def test_generate_meta_review(self, mock_shuffle, mock_google):
-        # Mock the random.shuffle function to maintain order for predictable testing
-        mock_shuffle.side_effect = lambda x: x
-        
-        # Mock the Google client
-        mock_google_instance = MagicMock()
-        mock_google_instance.generate.return_value = "Meta-review content"
-        mock_google.return_value = mock_google_instance
-        
+
+        # The factory table was consulted once
+        mock_get_factories.assert_called_once()
+
+        # Each requested reviewer built a client and generated once
+        assert mock_factory.call_count == 2
+        assert mock_client.generate.call_count == 2
+
+        # Results are keyed by reviewer name
+        assert set(reviews.keys()) == {"reviewer-1", "reviewer-2"}
+        assert reviews["reviewer-1"] == "Local review"
+        assert reviews["reviewer-2"] == "Local review"
+
+    @patch('ai_peer_review.review.get_client_factories')
+    @patch('ai_peer_review.review.extract_text_from_pdf')
+    def test_process_paper_filters_unknown_models(self, mock_extract_text, mock_get_factories):
+        # Reviewer names not in the factory table are silently skipped (the
+        # CLI validates against get_available_models first, but process_paper
+        # stays defensive).
+        mock_extract_text.return_value = "Paper content"
+        mock_client = MagicMock()
+        mock_client.generate.return_value = "Local review"
+        mock_get_factories.return_value = {
+            "reviewer-1": MagicMock(return_value=mock_client),
+        }
+
+        reviews = process_paper("test.pdf", ["reviewer-1", "does-not-exist"])
+
+        assert set(reviews.keys()) == {"reviewer-1"}
+        mock_client.generate.assert_called_once()
+
+    @patch('ai_peer_review.review.get_meta_reviewer_client')
+    def test_generate_meta_review(self, mock_get_meta_client):
+        # Mock the configured local meta-reviewer client
+        mock_client = MagicMock()
+        mock_client.generate.return_value = "Meta-review content"
+        mock_get_meta_client.return_value = mock_client
+
         # Test with sample reviews
         reviews = {
-            "model1": "Review 1 content",
-            "model2": "Review 2 content"
+            "reviewer-1": "Review 1 content",
+            "reviewer-2": "Review 2 content",
         }
-        
-        meta_review, ratings = generate_meta_review(reviews)
-        
-        # Check that the Google client was initialized with the correct model
-        mock_google.assert_called_once_with(model="gemini-2.5-pro-preview-05-06")
-        
-        # Check that the generate method was called
-        mock_google_instance.generate.assert_called_once()
-        
-        # Check that the meta_review contains the expected content
+
+        meta_review, mapping = generate_meta_review(reviews)
+
+        # The meta-reviewer client was built once and used once
+        mock_get_meta_client.assert_called_once()
+        mock_client.generate.assert_called_once()
+
+        # The meta-review text is returned verbatim (after stripping the
+        # CONCERNS_TABLE_DATA section, which is absent here)
         assert meta_review == "Meta-review content"
-        
-        # Check that NATO-to-model mapping was created
-        assert len(ratings) == 2
-        assert set(ratings.values()) == {"model1", "model2"}
+
+        # NATO-to-reviewer mapping was created for every reviewer
+        assert len(mapping) == 2
+        assert set(mapping.values()) == {"reviewer-1", "reviewer-2"}
+        assert set(mapping.keys()) == {"alfa", "bravo"}

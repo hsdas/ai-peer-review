@@ -40,9 +40,49 @@ def get_config_path(custom_path: Optional[str] = None) -> Path:
 
 
 def get_default_config() -> Dict[str, Any]:
-    """Return the default configuration."""
+    """Return the default configuration.
+
+    The default ships a single local reviewer plus a meta-reviewer, both
+    pointing at a local Ollama instance. Add more entries under
+    ``local_models`` (each can point at a different model or a different
+    server) to get genuine multi-perspective review.
+    """
     return {
         "api_keys": {},
+        "local_server": {
+            # Default OpenAI-compatible local server. Ollama's port is 11434.
+            # LM Studio uses http://localhost:1234/v1, llama.cpp uses 8080,
+            # vLLM uses 8000. Change this once and every reviewer inherits it
+            # unless the reviewer overrides "base_url".
+            "base_url": "http://localhost:11434/v1",
+            # Local servers ignore this value, but the OpenAI SDK requires a
+            # non-empty string.
+            "api_key": "local",
+        },
+        "local_models": {
+            # Each entry is one "reviewer". The key is the friendly name shown
+            # by `ai-peer-review list-models` and accepted by --models.
+            # Default tag is qwen3:32b (strong reasoning, fits a single 24GB
+            # GPU in 4-bit). See README for stronger alternatives.
+            "reviewer-1": {
+                "model": "qwen3:32b",
+                "base_url": None,   # None => inherit local_server.base_url
+                "api_key": None,    # None => inherit local_server.api_key
+                "temperature": 0.1,
+                "max_tokens": 8000,
+            }
+        },
+        "meta_reviewer": {
+            # Used for the meta-review and the concerns-extraction JSON call.
+            # Point this at your strongest available model with the longest
+            # context (the meta-review input is all individual reviews
+            # concatenated).
+            "model": "qwen3:32b",
+            "base_url": None,
+            "api_key": None,
+            "temperature": 0.1,
+            "max_tokens": 8000,
+        },
         "prompts": {
             "system": "You are a neuroscientist and expert in brain imaging.",
             "review": (
@@ -198,13 +238,122 @@ def set_api_key(key_name: str, api_key: str, config_file: Optional[str] = None) 
 def get_prompt(prompt_name: str, config_file: Optional[str] = None) -> str:
     """
     Get a prompt from the configuration file.
-    
+
     Args:
         prompt_name: Name of the prompt (e.g., 'system', 'review', 'metareview')
-        config_file: Optional path to a custom config file
-        
+        config_file: Optional path to the config file
+
     Returns:
         Prompt template string if found, empty string otherwise
     """
     config = load_config(config_file)
     return config.get("prompts", {}).get(prompt_name, "")
+
+
+def get_local_server_config(config_file: Optional[str] = None) -> Dict[str, Any]:
+    """Return the default local-server settings (base_url, api_key).
+
+    Individual reviewers and the meta-reviewer inherit these unless they
+    override ``base_url`` / ``api_key`` themselves.
+    """
+    config = load_config(config_file)
+    return config.get("local_server", {}) or {}
+
+
+def set_local_server(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    config_file: Optional[str] = None,
+) -> None:
+    """Update the default local-server settings. Only non-None fields are changed."""
+    config = load_config(config_file)
+    config_path = get_config_path(config_file)
+    server = config.setdefault("local_server", {})
+    if base_url is not None:
+        server["base_url"] = base_url
+    if api_key is not None:
+        server["api_key"] = api_key
+    save_config(config, config_path)
+
+
+def get_local_models(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Return the configured local reviewer models as ``{name: cfg}``."""
+    config = load_config(config_file)
+    models = config.get("local_models", {})
+    if not isinstance(models, dict) or not models:
+        # Fall back to the default reviewer so the tool always has something
+        # to run even on a fresh / hand-edited config.
+        return get_default_config()["local_models"]
+    return models
+
+
+def set_local_model(
+    name: str,
+    model: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    config_file: Optional[str] = None,
+) -> None:
+    """Add or update a local reviewer model entry."""
+    config = load_config(config_file)
+    config_path = get_config_path(config_file)
+    models = config.setdefault("local_models", {})
+    entry = models.get(name, {})
+    entry["model"] = model
+    if base_url is not None:
+        entry["base_url"] = base_url
+    if api_key is not None:
+        entry["api_key"] = api_key
+    if temperature is not None:
+        entry["temperature"] = temperature
+    if max_tokens is not None:
+        entry["max_tokens"] = max_tokens
+    models[name] = entry
+    save_config(config, config_path)
+
+
+def remove_local_model(name: str, config_file: Optional[str] = None) -> bool:
+    """Remove a local reviewer model entry. Returns True if it existed."""
+    config = load_config(config_file)
+    config_path = get_config_path(config_file)
+    models = config.get("local_models", {})
+    if name in models:
+        del models[name]
+        save_config(config, config_path)
+        return True
+    return False
+
+
+def get_meta_reviewer_config(config_file: Optional[str] = None) -> Dict[str, Any]:
+    """Return the meta-reviewer model config."""
+    config = load_config(config_file)
+    meta = config.get("meta_reviewer", {})
+    if not isinstance(meta, dict) or not meta:
+        return get_default_config()["meta_reviewer"]
+    return meta
+
+
+def set_meta_reviewer(
+    model: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    config_file: Optional[str] = None,
+) -> None:
+    """Update the meta-reviewer model entry."""
+    config = load_config(config_file)
+    config_path = get_config_path(config_file)
+    meta = config.setdefault("meta_reviewer", {})
+    meta["model"] = model
+    if base_url is not None:
+        meta["base_url"] = base_url
+    if api_key is not None:
+        meta["api_key"] = api_key
+    if temperature is not None:
+        meta["temperature"] = temperature
+    if max_tokens is not None:
+        meta["max_tokens"] = max_tokens
+    save_config(config, config_path)

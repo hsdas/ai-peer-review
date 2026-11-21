@@ -1,0 +1,2867 @@
+diff --git a/.env.example b/.env.example
+index b5c89da..f6c4b7a 100755
+--- a/.env.example
++++ b/.env.example
+@@ -1,17 +1,22 @@
+-# AI Peer Review - Environment Variables
+-# Copy this file to .env and fill in your API keys
++# AI Peer Review - Environment Variables (local models)
++# Copy this file to .env and adjust to point at your local inference server.
++#
++# No third-party LLM API keys are used. Every reviewer and the meta-reviewer
++# are served by an OpenAI-compatible local server you run yourself
++# (Ollama, LM Studio, llama.cpp, vLLM, LocalAI, ...), so the manuscript
++# text never leaves a machine you control.
+ 
+-# OpenAI API Key
+-OPENAI_API_KEY=your_openai_api_key_here
++# Default base URL of the local OpenAI-compatible server.
++# Ollama:      http://localhost:11434/v1
++# LM Studio:   http://localhost:1234/v1
++# llama.cpp:   http://localhost:8080/v1
++# vLLM:        http://localhost:8000/v1
++AI_PEER_REVIEW_BASE_URL=http://localhost:11434/v1
+ 
+-# Anthropic API Key
+-ANTHROPIC_API_KEY=your_anthropic_api_key_here
++# Placeholder "API key". Local servers ignore it, but the OpenAI Python SDK
++# requires a non-empty string. Leave as "local" unless your server enforces
++# a real key (rare).
++AI_PEER_REVIEW_API_KEY=local
+ 
+-# Google API Key
+-GOOGLE_API_KEY=your_google_api_key_here
+-
+-# DeepSeek API Key (if applicable)
+-DEEPSEEK_API_KEY=your_deepseek_api_key_here
+-
+-# Llama API Key (if applicable)
+-LLAMA_API_KEY=your_llama_api_key_here
+\ No newline at end of file
++# Optional: path to a custom config JSON (otherwise ~/.ai-peer-review/config.json).
++# AI_PEER_REVIEW_CONFIG_FILE=/path/to/config.json
+diff --git a/.gitignore b/.gitignore
+index 4ec6bb2..8abbb1f 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ # Python
+ __pycache__/
++.pytest_cache/
+ *.py[cod]
+ *$py.class
+ *.so
+diff --git a/CHANGES.md b/CHANGES.md
+new file mode 100644
+index 0000000..051650e
+--- /dev/null
++++ b/CHANGES.md
+@@ -0,0 +1,118 @@
++# CHANGES — local-models edition
++
++What changed relative to the upstream fork (`poldrack/ai-peer-review`):
++the cloud LLM API clients were removed and replaced with a single
++`LocalLLMClient` that talks to any OpenAI-compatible local inference server
++you run yourself. No third-party LLM API is contacted anywhere in the code.
++
++## Why
++
++The upstream tool submitted the manuscript to OpenAI, Anthropic, Google, and
++Together.ai. For peer review of **unpublished** manuscripts intended for Q1
++SCI journals, sending the text to a third-party LLM API is unacceptable: the
++provider may log or retain the prompt. This fork makes the tool structurally
++incapable of that — there is no longer any code path that sends the manuscript
++to a cloud LLM provider.
++
++## File-by-file
++
++### Removed (cloud API clients + their tests)
++- `src/ai_peer_review/llm_clients/openai_client.py` — OpenAI cloud client.
++- `src/ai_peer_review/llm_clients/anthropic_client.py` — Anthropic cloud client.
++- `src/ai_peer_review/llm_clients/google_client.py` — Google Gemini cloud client.
++- `src/ai_peer_review/llm_clients/deepseek_client.py` — DeepSeek via Together.ai.
++- `src/ai_peer_review/llm_clients/llama_client.py` — Llama 4 via Together.ai.
++- `tests/llm_clients/test_openai_client.py`
++- `tests/llm_clients/test_anthropic_client.py`
++
++### Added
++- `src/ai_peer_review/llm_clients/local_client.py` — `LocalLLMClient`, the
++  only LLM client. Uses the `openai` Python SDK pointed at a configurable
++  `base_url` (default Ollama `http://localhost:11434/v1`). No real API key
++  required (placeholder `"local"` is sent; local servers ignore it). Works
++  with Ollama, LM Studio, llama.cpp `llama-server`, vLLM, LocalAI, TGI.
++- `tests/llm_clients/test_local_client.py` — unit tests for the local client
++  (init precedence: args > env > config > default; generate payload shape).
++
++### Modified
++- `src/ai_peer_review/utils/config.py`
++  - `get_default_config()` now ships `local_server`, `local_models`
++    (one default reviewer `reviewer-1` → `qwen3:32b`), and `meta_reviewer`
++    sections, alongside the original `api_keys` and `prompts`.
++  - New helpers: `get_local_server_config`, `set_local_server`,
++    `get_local_models`, `set_local_model`, `remove_local_model`,
++    `get_meta_reviewer_config`, `set_meta_reviewer`.
++  - `get_api_key` / `set_api_key` retained (harmless, backward compatible) but
++    unused by the local pipeline.
++
++- `src/ai_peer_review/review.py`
++  - Replaced cloud-client imports with `LocalLLMClient`.
++  - New `_build_local_client(cfg, config_file)` builds a `LocalLLMClient` from
++    a config entry, inheriting `local_server` defaults for `base_url`/`api_key`.
++  - `get_client_factories(config_file)` builds the `{name: factory}` mapping
++    from `local_models`; each factory is instantiated on demand only.
++  - `get_meta_reviewer_client(config_file)` builds the meta-reviewer client
++    from the `meta_reviewer` section (replaces the hardcoded Google Gemini).
++  - `process_paper` and `generate_meta_review` signatures unchanged; they now
++    drive everything from config.
++  - Removed unused `import os`, `import random`.
++
++- `src/ai_peer_review/cli.py`
++  - `config` is now a **group** with subcommands: `show`, `server`, `add`,
++    `remove`, `meta` (replaces the old `config <service> <api_key>` command).
++  - `get_available_models(config_file)` is now dynamic — reads the keys of
++    `local_models`.
++  - `list-models` lists configured reviewer names.
++  - `review` command: replaced the second hardcoded `GoogleClient`
++    (concerns-extraction JSON call) with `get_meta_reviewer_client(config_file)`.
++  - Removed dead `from .review import save_concerns_as_csv` import.
++  - Help text updated throughout to reflect local-only operation.
++
++- `pyproject.toml`
++  - `requires-python` relaxed `>=3.13` → `>=3.10`.
++  - Removed deps no longer imported: `anthropic`, `google-generativeai`,
++    `pydantic`, `requests`, `tiktoken`, `tqdm`, `structlog`, `ipykernel`.
++  - Kept: `click`, `pypdf`, `openai>=1.0`, `python-dotenv`, `pandas`,
++    `pytest>=8.3.5`.
++  - `uv.lock` deleted (will be regenerated by `uv sync` / `uv lock`).
++
++- `.env.example` — replaced cloud API-key entries with
++  `AI_PEER_REVIEW_BASE_URL` and `AI_PEER_REVIEW_API_KEY` (local server).
++
++- `configs/scientific-only.json` — prompts unchanged; added
++  `local_server`, `local_models` (two reviewers: `qwen3:32b` +
++  `deepseek-r1:70b`), and `meta_reviewer` so the profile works locally
++  out of the box.
++
++- `README.md` — rewritten for local-model usage: confidentiality rationale,
++  recommended open-weight models (Kimi K3, DeepSeek-R1/V3, Qwen3, Llama 4
++  Scout, Llama 3.3, GLM-5.1, Gemma 3) with context lengths and rough VRAM,
++  hardware sizing guidance, quick start, multi-reviewer setup, config
++  reference, troubleshooting, and how to apply the changes to your fork.
++
++- `tests/test_review.py` — rewritten `test_process_paper` and
++  `test_generate_meta_review` to mock `get_client_factories` /
++  `get_meta_reviewer_client` (no cloud clients to patch). Added
++  `test_process_paper_filters_unknown_models`.
++
++- `tests/test_cli.py` — rewritten for the new `config` subcommands
++  (`test_config_add`, `test_config_server`, `test_config_meta`,
++  `test_config_remove`, `test_config_show`, `test_list_models`) and the
++  config-driven `review` command. Patches target the `cli` namespace
++  (`ai_peer_review.cli.process_paper`, etc.) because `cli.py` imports those
++  names directly.
++
++- `tests/test_config.py` — added assertions in `test_get_default_config` for
++  the new `local_server`, `local_models`, `meta_reviewer` sections.
++
++### Unchanged
++- `src/ai_peer_review/llm_clients/base_client.py` (abstract `BaseLLMClient`).
++- `src/ai_peer_review/utils/pdf.py` (`extract_text_from_pdf`).
++- `src/ai_peer_review/version.py`, `__init__.py` files, `LICENSE`,
++  `tests/test_pdf.py`, `tests/llm_clients/test_base_client.py`.
++
++## Verification
++- `pytest`: 39 passed.
++- End-to-end smoke test against a mock OpenAI-compatible server
++  (`scripts/mock_local_server.py`): two individual reviews → meta-review →
++  concerns CSV → `results.json` all produced correctly, with no cloud call.
+diff --git a/README.md b/README.md
+index 65910a3..2dfc42a 100755
+--- a/README.md
++++ b/README.md
+@@ -1,194 +1,329 @@
+-# AI Peer Review
+-
+-This package facilitates AI-based peer review of academic papers, particularly in neuroscience. It uses multiple large language models (LLMs) to generate independent reviews of a paper, and then creates a meta-review summarizing the key points.
+-
+-NOTE: All code in this project was AI-generated using Claude Code.
++# AI Peer Review (local-models edition)
++
++This fork of [`poldrack/ai-peer-review`](https://github.com/poldrack/ai-peer-review)
++generates AI peer reviews of academic papers using **locally-served LLMs only**.
++The original used cloud LLM APIs (OpenAI, Anthropic, Google, Together.ai); this
++fork removes every cloud API call so the manuscript text never leaves a machine
++you control. This is the intended mode for peer review of **unpublished**
++manuscripts you intend to submit to a Q1 SCI-indexed journal.
++
++> **What this is and is not.** This tool is a **pre-submission self-check**:
++> it surfaces scientific concerns before you submit, the way a critical
++> co-author or a friendly reviewer would. It is **not** a substitute for the
++> journal's actual peer-review process, and a positive AI review does not
++> imply acceptance. Treat its output as one signal among several.
++
++## Why local-only
++
++When you send an unpublished manuscript to a third-party LLM API, the provider
++may log, retain, or use the prompt content for model training, and the data
++transits networks you do not control. For unpublished work heading to a Q1 SCI
++journal, that risk is unacceptable. This fork makes the tool **structurally
++incapable** of contacting a third-party LLM provider: the cloud client files
++(`openai_client.py`, `anthropic_client.py`, `google_client.py`,
++`deepseek_client.py`, `llama_client.py`) and their API-key plumbing have been
++deleted. The only LLM client that remains, `LocalLLMClient`, talks to an
++OpenAI-compatible inference server **you** run.
++
++There is no `OPENAI_API_KEY`, no `ANTHROPIC_API_KEY`, and no network call to
++`api.openai.com` / `api.anthropic.com` / `generativelanguage.googleapis.com` /
++`api.together.xyz`. Even if you tried to re-enable a cloud model, there is no
++code path left that would send the manuscript to one.
+ 
+ ## Features
+ 
+-- Submit papers for review by multiple LLMs
+-- Generate individual peer reviews from various models
+-- Create a meta-review analyzing common themes and unique insights
+-- Generate a concerns table identifying which model found each concern
+-- Store results in markdown, CSV, and JSON formats
+-
+-## Supported Models
+-
+-- GPT-4o (via OpenAI API)
+-- GPT-4o-mini (via OpenAI API)
+-- Claude 3.7 Sonnet (via Anthropic API)
+-- Google Gemini 2.5 Pro (via Google AI API)
+-- DeepSeek R1 (via Together API)
+-- Llama 4 Maverick (via Together API)
++- Submit a paper (PDF) for review by one or more local LLMs
++- Generate an independent peer review per reviewer
++- Generate a meta-review that aggregates the individual reviews (reviewer
++  identifiers are stripped first, so the meta-reviewer cannot tell which
++  review came from which model)
++- Generate a concerns table (CSV) marking which reviewer raised each concern
++- Store everything in markdown, CSV, and JSON
++- Ships a **scientific-validity-only** review profile that suppresses
++  presentation nitpicks and focuses on methods, inference, statistics,
++  reproducibility, external validity, and claim-to-source support
++
++## Supported local servers
++
++Any server that implements the OpenAI `/v1/chat/completions` endpoint works.
++Common choices (default base URL shown):
++
++| Server | Default base URL | Notes |
++| --- | --- | --- |
++| [Ollama](https://ollama.com) | `http://localhost:11434/v1` | Easiest; one-command model pull. Default for this fork. |
++| [LM Studio](https://lmstudio.ai) | `http://localhost:1234/v1` | GUI; good for trying models before committing. |
++| [llama.cpp `llama-server`](https://github.com/ggml-org/llama.cpp) | `http://localhost:8080/v1` | Minimal; supports GGUF quants. |
++| [vLLM](https://github.com/vllm-project/vllm) | `http://localhost:8000/v1` | Highest throughput; best for serving several models at once on a multi-GPU box. |
++| [LocalAI](https://localai.io) | `http://localhost:8080/v1` | Drop-in for OpenAI clients. |
++| [TGI](https://github.com/huggingface/text-generation-inference) (with `--chat-template`) | `http://localhost:8080/v1` | Hugging Face's serving stack. |
++
++## Recommended models for Q1 SCI peer review
++
++For peer review at Q1 SCI quality you want **strong reasoning** and a **long
++context window** (a full manuscript plus references is often 20-50K tokens,
++and the meta-review input is every individual review concatenated, easily
++30-60K tokens). The models below are open-weight and current as of late 2026;
++verify exact Ollama tags with `ollama list` / `ollama show <model>` (tags
++change).
++
++| Model | License | Context | Why it fits | Rough VRAM (4-bit) |
++| --- | --- | --- | --- | --- |
++| **Kimi K3** (Moonshot) | open weights | 1 M | Top open model on Terminal-Bench 2.1 (Morph, Nov 2026); 2.8 T total / 104 B active MoE | large multi-GPU server |
++| **DeepSeek-R1** / **DeepSeek V3.2** | MIT | 64 K – 128 K | Explicit reasoning chain; strong on methods/statistics critique | 70 B distill ~40 GB; full V3 ~190 GB |
++| **Qwen3-235B-A22B** | Apache 2.0 | 256 K | Top-tier general + scientific reasoning; MoE so inference is cheaper than the parameter count suggests | ~130 GB |
++| **Qwen3-32B** | Apache 2.0 | 128 K | Strong balance; the shipped default. Fits one 24 GB GPU | ~20 GB |
++| **Llama 4 Scout** | Llama 4 license | 10 M | Best-in-class long context if you feed very large manuscripts + supplements | large multi-GPU |
++| **Llama 3.3 70B Instruct** | Llama 3.3 license | 128 K | Solid, well-understood general reasoning | ~40 GB (2×24 GB) |
++| **GLM-5.1** (Zhipu) | open weights | 128 K | Reported SOTA on community leaderboards (r/LocalLLaMA, Apr 2026) | model-size dependent |
++| **Gemma 3 27B IT** | Gemma terms | 128 K | Smaller but punchy; good "second opinion" reviewer | ~16 GB |
++
++Sources: Morph "Best Open Source LLMs (Nov 2026)" (`morph.so`); r/LocalLLaMA
++"Best Local LLMs - Apr 2026"; Hugging Face open-weights timeline
++(`hidekazu-konishi.com`, Jul 2026); DeepSeek model guide (Apr 2026).
++
++**Practical guidance.** A 27-32 B model on a single 24 GB consumer GPU (RTX
++3090/4090/A5000) is the realistic entry point and already meaningfully better
++than the 7-13 B models that are too weak for serious peer review. For Q1 SCI
++rigor, prefer ≥ 70 B (Llama 3.3 70B, DeepSeek-R1 70B distill) or a strong
++reasoning model (DeepSeek-R1, Qwen3-235B). If you do not have local GPU
++hardware, you can rent a GPU instance you fully control (e.g. RunPod, Lambda
++Labs, Vast.ai) and point this tool at the server you start there — note this is
++a pragmatic middle ground: you control the server and no third-party LLM API
++sees the prompt, but the manuscript does physically leave your premises, so
++pick a provider and region you trust and shut the instance down when done.
+ 
+ ## Installation
+ 
+ ```bash
+-# Create and activate a virtual environment (recommended)
+-python -m venv .venv
+-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
++git clone https://github.com/hsdas/ai-peer-review.git
++cd ai-peer-review
++
++# with uv (recommended; regenerates the lockfile for the trimmed deps)
++uv sync
+ 
+-# Install in development mode
++# or with plain pip
++python -m venv .venv
++source .venv/bin/activate      # Windows: .venv\Scripts\activate
+ pip install -e .
+ ```
+ 
+-## Usage
+-
+-### API Keys
++Requires Python ≥ 3.10. Dependencies are now minimal: `click`, `pypdf`,
++`openai` (used as the OpenAI-compatible client for the local server),
++`python-dotenv`, `pandas`, and `pytest`. The cloud SDKs (`anthropic`,
++`google-generativeai`) and unused helpers (`tiktoken`, `tqdm`, `structlog`,
++`pydantic`, `ipykernel`, `requests`) have been removed.
+ 
+-You can set API keys in two ways:
++## Quick start (single reviewer)
+ 
+-#### Using the CLI config command
++1. Start a local server and load a model. With Ollama:
+ 
+-```bash
+-# Set API keys (recommended)
+-ai-peer-review config openai "your-openai-key"
+-ai-peer-review config anthropic "your-anthropic-key"
+-ai-peer-review config google "your-google-key"
+-ai-peer-review config together "your-together-ai-key"  # Used for DeepSeek R1 and Llama 4 Maverick
+-```
++   ```bash
++   ollama pull qwen3:32b
++   ollama serve   # already running if `ollama pull` worked
++   ```
+ 
+-Keys are stored in `~/.ai-peer-review/config.json`.
++2. Point the tool at it and run a review:
+ 
+-#### Using environment variables
++   ```bash
++   # set the default local server once
++   ai-peer-review config server --base-url http://localhost:11434/v1
+ 
+-Alternatively, you can set environment variables either by exporting them or by using a `.env` file:
++   # the shipped default reviewer is named "reviewer-1" and uses qwen3:32b;
++   # change it if you loaded a different model:
++   ai-peer-review config add reviewer-1 --model qwen3:32b
++   ai-peer-review config meta     --model qwen3:32b
+ 
+-**Option 1: Export variables in your shell:**
++   # review a paper
++   ai-peer-review review path/to/paper.pdf
++   ```
+ 
+-```bash
+-export OPENAI_API_KEY="your-openai-key"
+-export ANTHROPIC_API_KEY="your-anthropic-key"
+-export GOOGLE_API_KEY="your-google-key"
+-export TOGETHER_API_KEY="your-together-ai-key"  # Used for DeepSeek R1 and Llama 4 Maverick
+-```
++Outputs land in `./papers/<paper-name>/`:
++`review_reviewer-1.md`, `meta_review.md`, `concerns_table.csv`, `results.json`.
+ 
+-**Option 2: Create a .env file:**
++## Multi-reviewer setup (genuine multi-perspective)
+ 
+-Copy the `.env.example` file to `.env` and fill in your API keys:
++The original tool's strength is running **several distinct models** so the
++meta-reviewer aggregates genuinely independent perspectives, the way multiple
++human reviewers would. To do this locally, add one entry per model and either
++serve them on separate ports or review against one model at a time:
+ 
+ ```bash
+-cp .env.example .env
+-# Edit the .env file with your API keys
+-```
+-
+-You can place the `.env` file in:
+-- The current working directory
+-- Your home directory at `~/.ai-peer-review/.env`
+-
+-### Command Line Interface
++# Three reviewers, each a different model family
++ai-peer-review config add reviewer-qwen     --model qwen3:32b
++ai-peer-review config add reviewer-deepseek --model deepseek-r1:70b
++ai-peer-review config add reviewer-llama    --model llama3.3:70b
+ 
+-Review a paper with all available models:
++# Use a strong/long-context model for the meta-review
++ai-peer-review config meta --model qwen3:32b
+ 
+-```bash
+-ai-peer-review review path/to/paper.pdf
++ai-peer-review list-models
++ai-peer-review review path/to/paper.pdf --models reviewer-qwen,reviewer-deepseek,reviewer-llama
+ ```
+ 
+-Specify specific models to use:
++If your hardware cannot hold several large models at once, run the same
++command multiple times with `--models reviewer-qwen`, then
++`--models reviewer-deepseek`, etc. — existing reviews are reused unless you
++pass `--overwrite`, so each run only calls the model you name. When all
++individual reviews exist, run once more (with any `--models` subset, or all of
++them) to generate the meta-review over the full set.
+ 
+-```bash
+-ai-peer-review review path/to/paper.pdf --models "gpt4-o1,claude-3.7-sonnet"
+-```
++## Configuration
+ 
+-Specify output directory:
++Configuration lives in `~/.ai-peer-review/config.json` (or the path you pass
++to `--config-file`, or `$AI_PEER_REVIEW_CONFIG_FILE`). It has four sections:
+ 
+-```bash
+-ai-peer-review review path/to/paper.pdf --output-dir ./my_reviews
++```jsonc
++{
++  "local_server": {                 // inherited by every reviewer unless it overrides
++    "base_url": "http://localhost:11434/v1",
++    "api_key": "local"              // ignored by local servers; SDK requires non-empty
++  },
++  "local_models": {                 // one entry per reviewer
++    "reviewer-1": {
++      "model": "qwen3:32b",         // tag as recognized by your local server
++      "base_url": null,             // null => inherit local_server.base_url
++      "api_key": null,
++      "temperature": 0.1,
++      "max_tokens": 8000
++    }
++  },
++  "meta_reviewer": {                // the model used for meta-review + concerns JSON
++    "model": "qwen3:32b",
++    "base_url": null,
++    "api_key": null,
++    "temperature": 0.1,
++    "max_tokens": 8000
++  },
++  "prompts": { "system": "...", "review": "...", "metareview": "...", "concerns_extraction": "..." }
++}
+ ```
+ 
+-Skip meta-review generation:
++### CLI config commands
+ 
+ ```bash
+-ai-peer-review review path/to/paper.pdf --no-meta-review
++ai-peer-review config show                                 # print local-model config
++ai-peer-review config server --base-url URL [--api-key K]  # set default server
++ai-peer-review config add NAME --model TAG [--base-url URL] [--temperature T] [--max-tokens N]
++ai-peer-review config remove NAME                          # remove a reviewer
++ai-peer-review config meta --model TAG [--base-url URL] [--temperature T] [--max-tokens N]
++ai-peer-review list-models                                 # list configured reviewers
+ ```
+ 
+-Use a custom configuration file:
++### Environment variables (quick single-model override)
+ 
+-```bash
+-ai-peer-review --config-file /path/to/custom/config.json review path/to/paper.pdf
+-```
+-
+-## Prompts and Configuration
++| Variable | Purpose |
++| --- | --- |
++| `AI_PEER_REVIEW_BASE_URL` | Base URL of the local server (overrides config) |
++| `AI_PEER_REVIEW_API_KEY` | Placeholder API key (overrides config) |
++| `AI_PEER_REVIEW_CONFIG_FILE` | Path to a custom config JSON |
+ 
+-The tool uses specific prompts for generating peer reviews and meta-reviews:
++Copy `.env.example` to `.env` to set these without exporting them each shell.
+ 
+-### Review Prompt
++## Scientific-validity-only profile
+ 
+-By default, papers are submitted to LLMs with the following prompt:
++`configs/scientific-only.json` ships a ready-to-use prompt profile that
++instructs the models to raise a criticism **only when resolving it could change
++the validity, support, scope, reproducibility, or interpretation of a
++scientific claim**, and to exclude concerns whose only consequence is
++formatting, length, readability, layout, grammar, or prose style. This is the
++recommended profile for Q1 SCI submission prep — it focuses the review on
++methods, inference, statistics, reproducibility, external validity,
++demonstrated novelty of explicit novelty claims, and claim-to-source support,
++and asks for a recommendation that would be unchanged if the paper were
++reformatted without changing its evidence or claims. The profile now also
++carries a `local_models` / `meta_reviewer` block (two reviewers: Qwen3 + a
++DeepSeek-R1 reasoning reviewer) so it works out of the box locally.
+ 
+-```
+-You are a neuroscientist and expert in brain imaging who has been asked to provide 
+-a peer review for a submitted research paper, which is attached here. Please provide 
+-a thorough and critical review of the paper. First provide a summary of the study 
+-and its results, and then provide a detailed point-by-point analysis of any flaws in the study.
++```bash
++ai-peer-review --config-file configs/scientific-only.json review path/to/paper.pdf
+ ```
+ 
+-### Meta-Review Prompt
++The profile keeps the original placeholders (`{paper_text}`, `{reviews_text}`,
++`{meta_review_text}`, `{model_names}`, `{first_model}`, `{second_model}`,
++`{model_mapping}`), the `CONCERNS_TABLE_DATA` marker, the fenced JSON block,
++and the NATO phonetic reviewer names, so the interpolation and output-parsing
++contracts the pipeline relies on are preserved.
++
++### CPU-only / low-RAM machines (no GPU, ~8 GB RAM)
++
++`configs/cpu-small.json` is the same scientific-validity profile retuned for a
++modest CPU-only box (e.g. an Intel i5-3450 with 8 GB DDR3 and no GPU). It
++configures a single **Phi-4-mini** reviewer (3.8 B, ~2.5 GB in 4-bit, 128 K
++context — the strongest model that fits alongside the OS and this tool in
++8 GB) and lowers `max_tokens` to 4000 to bound generation time on slow CPU
++inference. Expect a full review to take 10-30 minutes per paper on such
++hardware, and treat the output as a first-pass screening check rather than a
++rigorous review: a 3.8 B model catches obvious issues (sample-size
++over-generalization, missing uncertainty, unsupported causal claims) but
++misses subtler methodological flaws a 70 B+ model would surface.
+ 
+-The meta-review is generated using the following prompt:
+-
+-```
+-The attached files contain peer reviews of a research article. Please summarize 
+-these into a meta-review, highlighting both the common points raised across reviewers 
+-as well as any specific concerns that were only raised by some reviewers. Then rank 
+-the reviews in terms of their usefulness and identification of critical issues.
++```bash
++ai-peer-review --config-file configs/cpu-small.json review path/to/paper.pdf
+ ```
+ 
+-When generating the meta-review, all model identifiers are removed from the individual reviews to prevent bias.
+-
+-### Customizing Prompts
+-
+-You can customize the prompts used by the tool by editing the configuration file:
+-
+-1. Locate or create the configuration file at `~/.ai-peer-review/config.json`
+-2. Add or modify the `prompts` section:
++**Older CPUs without AVX2** (Ivy Bridge and earlier, ~2012): Ollama bundles an
++AVX-only runner and should auto-select it, but if `ollama serve` fails to
++start or crashes on model load, fall back to `llama.cpp`'s `llama-server`
++(which compiles for the host CPU's instruction set, including AVX1-only) and
++point the tool at it — the `LocalLLMClient` works with any OpenAI-compatible
++server, not just Ollama. See the troubleshooting section.
+ 
+-```json
+-{
+-  "api_keys": {
+-    ...
+-  },
+-  "prompts": {
+-    "system": "Your custom system prompt",
+-    "review": "Your custom review prompt. Include the {paper_text} placeholder where the paper text should be inserted.",
+-    "metareview": "Your custom meta-review prompt. Include the {reviews_text} placeholder where the reviews should be inserted."
+-  }
+-}
+-```
+-
+-The configuration file will be created automatically with default prompts if it doesn't exist. You can modify it to suit your needs.
++## Outputs
+ 
+-### Using a Custom Configuration File
++For each paper (default `./papers/<paper-name>/`):
+ 
+-You can specify a custom configuration file path using the `--config-file` option:
++- `review_<reviewer-name>.md` — individual review from each local reviewer
++- `meta_review.md` — synthesized meta-review (reviewer identities stripped)
++- `concerns_table.csv` — one row per concern, one boolean column per reviewer
++- `results.json` — `individual_reviews`, `meta_review`, `reviewer_to_model`
+ 
+-```bash
+-ai-peer-review --config-file /path/to/custom/config.json review path/to/paper.pdf
+-```
++## Applying these changes to your fork
+ 
+-This allows you to maintain multiple configuration files for different purposes or environments. The custom config file will be used for all operations in that command session, including loading prompts and API keys.
++This directory is the modified fork. Two ways to get it onto your GitHub fork:
+ 
+-### Bundled profile: scientific-validity-only review
++1. **Copy in place.** Copy these files over your working copy, commit, push:
+ 
+-The repository ships a ready-to-use configuration profile at `configs/scientific-only.json` that swaps the default prompts for a **scientific-validity-only** reviewing standard. The review, meta-review, and concerns-extraction prompts instruct the models to raise a criticism only when resolving it could change the validity, support, scope, reproducibility, or interpretation of a scientific claim, and to exclude concerns whose only consequence is formatting, length, readability, layout, grammar, or prose style (a wording or labeling issue is kept only when it creates scientifically consequential ambiguity, such as an undefined unit or an inconsistent cohort label). The prompts ask for a recommendation that would be unchanged if the paper were reformatted without changing its evidence or claims.
++   ```bash
++   cd /path/to/your/ai-peer-review
++   cp -r /home/z/my-project/download/ai-peer-review-local/. .
++   git add -A
++   git commit -m "Replace cloud LLM APIs with local OpenAI-compatible models"
++   git push
++   ```
+ 
+-This is useful when you want the models to focus on methods, inference, statistics, reproducibility, external validity, demonstrated novelty of explicit novelty claims, and claim-to-source support rather than producing presentation nitpicks. Because the prompts operate on the extracted PDF text, they instruct the models to treat a missing item as a request for clarification rather than asserting the work was not done.
++2. **Apply as a patch.** A `local-models.patch` is shipped alongside this
++   directory; from the root of your fork:
+ 
+-Run a review with the profile via the existing `--config-file` option:
++   ```bash
++   git apply --whitespace=fix local-models.patch
++   ```
+ 
+-```bash
+-ai-peer-review --config-file configs/scientific-only.json review path/to/paper.pdf
+-```
++   (The patch is generated against the upstream commit your fork was created
++   from; re-generate it with `diff -ruN <upstream> <this-dir>` if it no longer
++   applies cleanly.)
+ 
+-API keys are resolved from `*_API_KEY` environment variables first (see [API Keys](#api-keys) above), so you do not need to put any secrets in the profile; its `api_keys` section is intentionally left empty. If you prefer to keep keys in a config file, copy the profile to a private, untracked location and add them there rather than editing the tracked copy.
++See `CHANGES.md` for the full, file-by-file change summary.
+ 
+-The profile keeps the same placeholders (`{paper_text}`, `{reviews_text}`, `{meta_review_text}`, `{model_names}`, `{first_model}`, `{second_model}`, `{model_mapping}`), the `CONCERNS_TABLE_DATA` marker, the fenced JSON block, and the NATO phonetic reviewer names, so it preserves the interpolation and output-parsing contracts the existing pipeline relies on.
++## Troubleshooting
+ 
+-## Outputs
++- **`Connection refused` / `openai.APIConnectionError`** — the local server is
++  not running or the `base_url` is wrong. Check `curl http://localhost:11434/v1/models`
++  (Ollama) responds, and that `ai-peer-review config show` shows the URL you
++  expect.
++- **`model not found`** — the model tag in the config does not match what the
++  server has loaded. With Ollama, run `ollama list` and copy the exact tag.
++- **Truncated reviews** — raise `max_tokens` for that reviewer:
++  `ai-peer-review config add reviewer-1 --model qwen3:32b --max-tokens 12000`.
++- **Slow generation on a large model** — pass a longer timeout by editing the
++  reviewer entry, or use a smaller / distilled model. DeepSeek-R1 reasoning
++  traces are long; expect minutes per review.
++- **Concerns table is empty** — the meta-reviewer did not emit the
++  `CONCERNS_TABLE_DATA` marker. Re-run with `--overwrite`, or use the
++  scientific-validity-only profile, which is more reliable about the marker.
++- **Out-of-memory on GPU** — drop to a smaller quant or a smaller model. With
++  Ollama, the default tag is usually a 4-bit quant; a `:32b` model on a 24 GB
++  GPU is near the limit — close other VRAM consumers.
+ 
+-The tool generates the following outputs in the specified directory (default: `./papers/[paper-name]`):
++## License
+ 
+-- `review_[model-name].md` - Individual reviews from each LLM
+-- `meta_review.md` - Summary and analysis of all reviews
+-- `concerns_table.csv` - CSV file with concerns identified by each model
+-- `results.json` - Structured data containing all reviews, meta-review, and reviewer-to-model mapping
+\ No newline at end of file
++Inherits the upstream license (see `LICENSE`).
+diff --git a/configs/cpu-small.json b/configs/cpu-small.json
+new file mode 100644
+index 0000000..8bd579e
+--- /dev/null
++++ b/configs/cpu-small.json
+@@ -0,0 +1,30 @@
++{
++  "_comment": "CPU-only / low-RAM profile. Tuned for a machine with ~8GB RAM and no GPU (e.g. Intel i5-3450, Ivy Bridge). Uses Phi-4-mini (3.8B, ~2.5GB in Q4_K_M, 128K context) — the strongest reasoning model that comfortably fits alongside the OS and this Python tool in 8GB. A single reviewer is configured because running several small models concurrently on a 4-core CPU is impractical; for genuine multi-perspective review, run this command once per model tag (see README). max_tokens is set to 4000 (down from 8000) to bound generation time on slow CPU inference. Prompts are identical to configs/scientific-only.json (scientific-validity-only standard).",
++  "api_keys": {},
++  "local_server": {
++    "base_url": "http://localhost:11434/v1",
++    "api_key": "local"
++  },
++  "local_models": {
++    "reviewer-1": {
++      "model": "phi4-mini",
++      "base_url": null,
++      "api_key": null,
++      "temperature": 0.1,
++      "max_tokens": 4000
++    }
++  },
++  "meta_reviewer": {
++    "model": "phi4-mini",
++    "base_url": null,
++    "api_key": null,
++    "temperature": 0.1,
++    "max_tokens": 4000
++  },
++  "prompts": {
++    "system": "You are an expert peer reviewer. You evaluate a manuscript only on scientific validity: whether its central claims follow from the evidence, and whether its methods, inference, reproducibility, external validity, demonstrated novelty of its explicit novelty claims, and claim-to-source support hold. You do not use writing, formatting, or presentation quality to justify a recommendation.",
++    "review": "You are an expert peer reviewer asked to review the attached research paper. Apply a scientific-validity-only standard.\n\nCore rule: raise a criticism only when resolving it could change the validity, support, scope, reproducibility, or interpretation of a scientific claim. Do not use formatting or presentation quality to justify the recommendation.\n\nYou are given only the extracted text of the paper. Distinguish 'not reported in the supplied text' from 'not performed': text extraction may drop equations, tables, figure contents, or supplements, so flag a missing item as a request for clarification rather than asserting the work was not done. Do not invent missing experiments, citations, results, or venue requirements.\n\nRaise concerns about:\n- whether the central claims follow from the evidence;\n- study, survey, corpus, sampling, screening, or coding design;\n- selection bias, confounding, controls, baselines, metrics, statistics, and uncertainty;\n- unit-of-analysis consistency and construct validity;\n- reproducibility, robustness, sensitivity, and inter-rater reliability;\n- external validity, population or jurisdictional scope, and generalization;\n- whether an explicit novelty or priority claim is actually demonstrated (do not penalize a paper for insufficient originality when it makes no such claim);\n- load-bearing citations that, on the evidence available in the supplied text, do not support the adjacent claim;\n- a result described as directly measured when the supplied text shows it was derived, modeled, or inferred;\n- conclusions that exceed the paper's demonstrated claim ceiling.\n\nExclude concerns whose only consequence is: too many tables/figures/pages; repetition, readability, section order, or narrative flow; visual layout, figure aesthetics, or typography; grammar, copyediting, or prose style. A wording or labeling issue is in scope only when it creates scientifically consequential ambiguity (for example an undefined unit, a missing denominator, or an inconsistent cohort or variable label that changes how a result is interpreted); state the interpretive consequence, not the stylistic preference.\n\nProduce your review in this structure:\n1. Summary of the study and its central scientific claims, claimed contribution, evidence base, and claim ceiling.\n2. Strengths that are material to scientific validity.\n3. Major scientific concerns: issues whose resolution could change whether a load-bearing claim (central, or a material secondary causal, safety, or generalization claim) is supported.\n4. Minor scientific comments: concerns that pass the same claim-consequence gate but are bounded in scope. Do not list stylistic nitpicks here.\n5. Recommendation (Accept / Minor Revision / Major Revision / Reject) justified only by the retained scientific concerns. The recommendation must remain the same if the paper were reformatted without changing its evidence or claims.\n\nFor each concern, state: (a) the exact claim, section, table, figure, or citation; (b) what the supplied text actually shows, or that the point cannot be verified from the supplied text; (c) which inference becomes unsupported, biased, non-reproducible, or too broad; (d) the smallest scientific remedy that would resolve it. Do not prescribe extensive new work when narrowing the claim would be scientifically sufficient.\n\nHere is the paper to review:\n\n{paper_text}",
++    "metareview": "The reviews below are peer reviews of one research article, from anonymized reviewers named with the NATO phonetic alphabet (alfa, bravo, charlie, ...).\n\nSynthesize them into a meta-review that applies a scientific-validity-only standard. A concern belongs in the meta-review only if resolving it could change the validity, support, scope, reproducibility, or interpretation of a scientific claim. Drop any concern whose only consequence is formatting, length, readability, layout, grammar, or prose style, even if a reviewer raised it; keep a wording or labeling issue only when it creates scientifically consequential ambiguity.\n\nAttribute each concern to the reviewers who raised it and preserve material disagreements between reviewers. Do not add concerns that no reviewer raised, and do not treat the number of reviewers who raised a concern as evidence that the concern is correct.\n\nIdentify the scientific concerns raised in common across reviewers and the distinct scientific concerns raised by only some reviewers. Refer to reviewers by their assigned NATO phonetic name (alfa, bravo, charlie, ...) throughout. Then rank the reviews by how well they identify scientifically critical issues, not by tone or thoroughness of presentation critique.\n\nAfter the meta-review prose, output a line containing only the marker CONCERNS_TABLE_DATA, immediately followed by exactly one fenced JSON code block. The JSON is an object with a 'concerns' array; each element is one distinct retained scientific concern, with a 'concern' string and one boolean field per reviewer (true if that reviewer raised it). Add a row per concern and a boolean field per reviewer as needed. Use this shape:\n\n```json\n{{\n  \"concerns\": [\n    {{\n      \"concern\": \"Brief description of scientific concern 1\",\n      \"alfa\": true,\n      \"bravo\": false\n    }}\n  ]\n}}\n```\n\n{reviews_text}",
++    "concerns_extraction": "Based on the meta-review, extract the retained scientific concerns. Include a concern only if resolving it could change the validity, support, scope, reproducibility, or interpretation of a scientific claim; exclude concerns whose only consequence is formatting, length, readability, layout, grammar, or prose style.\n\nCreate a JSON object with a 'concerns' array. Each concern object should have:\n1. A 'concern' field with a brief description\n2. One field for each model: {model_names}\n3. Each model field should be true if that model identified the concern, false otherwise\n\nReturn one row per distinct concern and one field per model. Example shape:\n{{\n  \"concerns\": [\n    {{\n      \"concern\": \"Brief description of scientific concern 1\",\n      \"{first_model}\": true,\n      \"{second_model}\": false\n    }}\n  ]\n}}\n\nReturn only valid JSON without any explanation.\n\nMeta-review:\n{meta_review_text}\n\nModel name mapping (for reference):\n{model_mapping}"
++  }
++}
+diff --git a/configs/scientific-only.json b/configs/scientific-only.json
+index 2462fd3..99c2ff9 100755
+--- a/configs/scientific-only.json
++++ b/configs/scientific-only.json
+@@ -1,5 +1,32 @@
+ {
+   "api_keys": {},
++  "local_server": {
++    "base_url": "http://localhost:11434/v1",
++    "api_key": "local"
++  },
++  "local_models": {
++    "reviewer-1": {
++      "model": "qwen3:32b",
++      "base_url": null,
++      "api_key": null,
++      "temperature": 0.1,
++      "max_tokens": 8000
++    },
++    "reviewer-2": {
++      "model": "deepseek-r1:70b",
++      "base_url": null,
++      "api_key": null,
++      "temperature": 0.1,
++      "max_tokens": 8000
++    }
++  },
++  "meta_reviewer": {
++    "model": "qwen3:32b",
++    "base_url": null,
++    "api_key": null,
++    "temperature": 0.1,
++    "max_tokens": 8000
++  },
+   "prompts": {
+     "system": "You are an expert peer reviewer. You evaluate a manuscript only on scientific validity: whether its central claims follow from the evidence, and whether its methods, inference, reproducibility, external validity, demonstrated novelty of its explicit novelty claims, and claim-to-source support hold. You do not use writing, formatting, or presentation quality to justify a recommendation.",
+     "review": "You are an expert peer reviewer asked to review the attached research paper. Apply a scientific-validity-only standard.\n\nCore rule: raise a criticism only when resolving it could change the validity, support, scope, reproducibility, or interpretation of a scientific claim. Do not use formatting or presentation quality to justify the recommendation.\n\nYou are given only the extracted text of the paper. Distinguish 'not reported in the supplied text' from 'not performed': text extraction may drop equations, tables, figure contents, or supplements, so flag a missing item as a request for clarification rather than asserting the work was not done. Do not invent missing experiments, citations, results, or venue requirements.\n\nRaise concerns about:\n- whether the central claims follow from the evidence;\n- study, survey, corpus, sampling, screening, or coding design;\n- selection bias, confounding, controls, baselines, metrics, statistics, and uncertainty;\n- unit-of-analysis consistency and construct validity;\n- reproducibility, robustness, sensitivity, and inter-rater reliability;\n- external validity, population or jurisdictional scope, and generalization;\n- whether an explicit novelty or priority claim is actually demonstrated (do not penalize a paper for insufficient originality when it makes no such claim);\n- load-bearing citations that, on the evidence available in the supplied text, do not support the adjacent claim;\n- a result described as directly measured when the supplied text shows it was derived, modeled, or inferred;\n- conclusions that exceed the paper's demonstrated claim ceiling.\n\nExclude concerns whose only consequence is: too many tables/figures/pages; repetition, readability, section order, or narrative flow; visual layout, figure aesthetics, or typography; grammar, copyediting, or prose style. A wording or labeling issue is in scope only when it creates scientifically consequential ambiguity (for example an undefined unit, a missing denominator, or an inconsistent cohort or variable label that changes how a result is interpreted); state the interpretive consequence, not the stylistic preference.\n\nProduce your review in this structure:\n1. Summary of the study and its central scientific claims, claimed contribution, evidence base, and claim ceiling.\n2. Strengths that are material to scientific validity.\n3. Major scientific concerns: issues whose resolution could change whether a load-bearing claim (central, or a material secondary causal, safety, or generalization claim) is supported.\n4. Minor scientific comments: concerns that pass the same claim-consequence gate but are bounded in scope. Do not list stylistic nitpicks here.\n5. Recommendation (Accept / Minor Revision / Major Revision / Reject) justified only by the retained scientific concerns. The recommendation must remain the same if the paper were reformatted without changing its evidence or claims.\n\nFor each concern, state: (a) the exact claim, section, table, figure, or citation; (b) what the supplied text actually shows, or that the point cannot be verified from the supplied text; (c) which inference becomes unsupported, biased, non-reproducible, or too broad; (d) the smallest scientific remedy that would resolve it. Do not prescribe extensive new work when narrowing the claim would be scientifically sufficient.\n\nHere is the paper to review:\n\n{paper_text}",
+diff --git a/pyproject.toml b/pyproject.toml
+index 42a954d..29bbd4f 100755
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,27 +1,19 @@
+ [project]
+ name = "ai-peer-review"
+ version = "0.1.0"
+-description = "AI-based peer review of academic papers"
++description = "AI-based peer review of academic papers using locally-served LLMs"
+ readme = "README.md"
+ authors = [
+     { name = "Russell Poldrack", email = "poldrack@gmail.com" }
+ ]
+-requires-python = ">=3.13"
++requires-python = ">=3.10"
+ dependencies = [
+     "click",
+-    "pydantic",
+-    "requests",
+     "pypdf",
+-    "openai",
+-    "anthropic",
+-    "google-generativeai",
+-    "tiktoken",
+-    "tqdm",
+-    "pytest>=8.3.5",
++    "openai>=1.0",
+     "python-dotenv",
+-    "structlog",
+     "pandas",
+-    "ipykernel>=6.29.5",
++    "pytest>=8.3.5",
+ ]
+ 
+ [project.scripts]
+diff --git a/src/ai_peer_review/cli.py b/src/ai_peer_review/cli.py
+index 85d392c..6ab4aa3 100755
+--- a/src/ai_peer_review/cli.py
++++ b/src/ai_peer_review/cli.py
+@@ -1,10 +1,18 @@
+ import click
+-import os
+ import json
+ import re
+ from pathlib import Path
+-from .review import process_paper, generate_meta_review
+-from .utils.config import get_api_key, set_api_key, get_prompt
++
++from .review import process_paper, generate_meta_review, get_meta_reviewer_client
++from .utils.config import (
++    get_prompt,
++    load_config,
++    get_local_models,
++    set_local_server,
++    set_local_model,
++    remove_local_model,
++    set_meta_reviewer,
++)
+ from .version import __version__
+ 
+ 
+@@ -14,52 +22,137 @@ from .version import __version__
+     "--config-file",
+     type=click.Path(exists=False),
+     help="Path to a custom configuration file",
+-    envvar="AI_PEER_REVIEW_CONFIG_FILE"
++    envvar="AI_PEER_REVIEW_CONFIG_FILE",
+ )
+ @click.pass_context
+ def cli(ctx, config_file):
+-    """AI-based peer review of academic papers."""
++    """AI-based peer review of academic papers using locally-served LLMs.
++
++    No third-party LLM API is contacted: every reviewer and the meta-reviewer
++    are served by an OpenAI-compatible local inference server you configure
++    with the ``config`` subcommands.
++    """
+     # Store config path in context for subcommands to access
+     ctx.ensure_object(dict)
+     ctx.obj["config_file"] = config_file
+ 
+ 
+-@cli.command()
+-@click.argument("service", type=click.Choice(["openai", "anthropic", "google", "together"]))
+-@click.argument("api_key", type=str)
++@cli.group()
++@click.pass_context
++def config(ctx):
++    """Configure the local inference server and reviewer models."""
++
++
++@config.command("show")
++@click.pass_context
++def config_show(ctx):
++    """Print the current local-model configuration."""
++    config_file = ctx.obj.get("config_file")
++    cfg = load_config(config_file)
++    click.echo(json.dumps(
++        {
++            "local_server": cfg.get("local_server", {}),
++            "local_models": cfg.get("local_models", {}),
++            "meta_reviewer": cfg.get("meta_reviewer", {}),
++        },
++        indent=2,
++    ))
++
++
++@config.command("server")
++@click.option("--base-url", required=True,
++              help="OpenAI-compatible base URL of the local server "
++                   "(e.g. http://localhost:11434/v1 for Ollama).")
++@click.option("--api-key", default=None,
++              help="Placeholder API key. Local servers ignore it; the OpenAI "
++                   "SDK just requires a non-empty string.")
++@click.pass_context
++def config_server(ctx, base_url, api_key):
++    """Set the default local inference server (inherited by all reviewers)."""
++    config_file = ctx.obj.get("config_file")
++    set_local_server(base_url=base_url, api_key=api_key, config_file=config_file)
++    click.echo(f"Default local server set to {base_url}")
++
++
++@config.command("add")
++@click.argument("name")
++@click.option("--model", required=True,
++              help="Model tag as recognized by the local server "
++                   "(e.g. qwen3:32b, deepseek-r1:70b).")
++@click.option("--base-url", default=None,
++              help="Override the default server for this reviewer only.")
++@click.option("--api-key", default=None, help="Override the default api key.")
++@click.option("--temperature", type=float, default=None,
++              help="Sampling temperature (default 0.1).")
++@click.option("--max-tokens", type=int, default=None,
++              help="Max tokens to generate (default 8000).")
+ @click.pass_context
+-def config(ctx, service, api_key):
+-    """Set API key for a service."""
++def config_add(ctx, name, model, base_url, api_key, temperature, max_tokens):
++    """Add or update a local reviewer model named NAME."""
+     config_file = ctx.obj.get("config_file")
+-    set_api_key(service, api_key, config_file)
+-    click.echo(f"API key for {service} has been set successfully.")
+-
+-
+-@cli.command()
+-def list_models():
+-    """List all available models for review."""
+-    available_models = get_available_models()
+-    
+-    click.echo("Available models for peer review:")
+-    for model in available_models:
+-        click.echo(f"- {model}")
+-    
+-    click.echo("\nUse these model names with the --models option when running 'ai-peer-review review'.")
+-
+-
+-def get_available_models():
+-    """Return a list of all available models for review."""
+-    return [
+-        "gpt4-o1",
+-        "gpt4-o3-mini",
+-        "claude-3.7-sonnet",
+-        "gemini-2.5-pro",
+-        "deepseek-r1",
+-        "llama-4-maverick"
+-    ]
+-
+-
+-@cli.command()
++    set_local_model(
++        name, model,
++        base_url=base_url, api_key=api_key,
++        temperature=temperature, max_tokens=max_tokens,
++        config_file=config_file,
++    )
++    click.echo(f"Reviewer '{name}' -> model '{model}' configured.")
++
++
++@config.command("remove")
++@click.argument("name")
++@click.pass_context
++def config_remove(ctx, name):
++    """Remove a local reviewer model named NAME."""
++    config_file = ctx.obj.get("config_file")
++    if remove_local_model(name, config_file=config_file):
++        click.echo(f"Reviewer '{name}' removed.")
++    else:
++        click.echo(f"Reviewer '{name}' not found.")
++
++
++@config.command("meta")
++@click.option("--model", required=True,
++              help="Model tag for the meta-reviewer (use your strongest / "
++                   "longest-context model).")
++@click.option("--base-url", default=None)
++@click.option("--api-key", default=None)
++@click.option("--temperature", type=float, default=None)
++@click.option("--max-tokens", type=int, default=None)
++@click.pass_context
++def config_meta(ctx, model, base_url, api_key, temperature, max_tokens):
++    """Set the meta-reviewer model."""
++    config_file = ctx.obj.get("config_file")
++    set_meta_reviewer(
++        model,
++        base_url=base_url, api_key=api_key,
++        temperature=temperature, max_tokens=max_tokens,
++        config_file=config_file,
++    )
++    click.echo(f"Meta-reviewer set to model '{model}'.")
++
++
++@cli.command("list-models")
++@click.pass_context
++def list_models(ctx):
++    """List all configured local reviewer models."""
++    config_file = ctx.obj.get("config_file")
++    available_models = get_available_models(config_file)
++
++    click.echo("Configured local reviewer models:")
++    for model_name in available_models:
++        click.echo(f"- {model_name}")
++
++    click.echo("\nUse these names with the --models option when running "
++               "'ai-peer-review review'. Add more with 'ai-peer-review config add'.")
++
++
++def get_available_models(config_file=None):
++    """Return the list of configured reviewer names (keys of local_models)."""
++    return list(get_local_models(config_file).keys())
++
++
++@cli.command("review")
+ @click.argument("pdf_path", type=click.Path(exists=True, file_okay=True, dir_okay=False))
+ @click.option(
+     "--output-dir",
+@@ -75,7 +168,8 @@ def get_available_models():
+ @click.option(
+     "--models",
+     type=str,
+-    help="Comma-separated list of models to use. Default is all supported models.",
++    help="Comma-separated list of reviewer names to use. Default is all "
++         "configured reviewers.",
+ )
+ @click.option(
+     "--overwrite/--no-overwrite",
+@@ -84,17 +178,18 @@ def get_available_models():
+ )
+ @click.pass_context
+ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+-    """Process a paper and generate peer reviews using multiple LLMs."""
++    """Process a paper and generate peer reviews using local LLMs."""
+     # Use the input file's stem (filename without extension) as the output directory
+     pdf_path = Path(pdf_path)
+     file_stem = pdf_path.stem
+     output_dir = Path(output_dir) / file_stem
+     output_dir.mkdir(exist_ok=True, parents=True)
+-    
++
+     click.echo(f"Output will be saved to: {output_dir}")
+-    
+-    available_models = get_available_models()
+-    
++
++    config_file = ctx.obj.get("config_file")
++    available_models = get_available_models(config_file)
++
+     selected_models = available_models
+     if models:
+         model_list = [m.strip() for m in models.split(",")]
+@@ -102,18 +197,18 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+         if not selected_models:
+             click.echo(f"No valid models specified. Available models: {', '.join(available_models)}")
+             return
+-    
++
+     click.echo(f"Processing paper: {pdf_path}")
+-    click.echo(f"Selected models: {', '.join(selected_models)}")
+-    
++    click.echo(f"Selected reviewers: {', '.join(selected_models)}")
++
+     # Check for existing reviews and only process missing ones
+     reviews = {}
+     review_data = {}
+     models_to_process = []
+-    
++
+     for model_name in selected_models:
+         review_file = output_dir / f"review_{model_name}.md"
+-        
++
+         if review_file.exists() and not overwrite:
+             # Read existing review
+             with open(review_file, "r") as f:
+@@ -123,13 +218,12 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+             click.echo(f"Using existing review for {model_name} from {review_file}")
+         else:
+             models_to_process.append(model_name)
+-    
++
+     # Process papers with LLMs for missing or to-be-overwritten reviews
+     if models_to_process:
+-        click.echo(f"Processing models: {', '.join(models_to_process)}")
+-        config_file = ctx.obj.get("config_file")
++        click.echo(f"Processing reviewers: {', '.join(models_to_process)}")
+         new_reviews = process_paper(pdf_path, models_to_process, config_file)
+-        
++
+         # Save new reviews
+         for model, review_text in new_reviews.items():
+             review_file = output_dir / f"review_{model}.md"
+@@ -138,35 +232,28 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+             reviews[model] = review_text
+             review_data[model] = review_text
+             click.echo(f"Review from {model} saved to {review_file}")
+-    
++
+     if not reviews:
+         click.echo("No reviews to process. Use --overwrite to regenerate existing reviews.")
+-    
++
+     # Generate meta-review if requested
+     if meta_review:
+         click.echo("Generating meta-review...")
+-        config_file = ctx.obj.get("config_file")
+         meta_review_text, nato_to_model = generate_meta_review(reviews, config_file)
+-        
+-        # Get the full meta-review text before cleaning for table extraction
+-        from .review import save_concerns_as_csv
+-        
++
+         meta_review_file = output_dir / "meta_review.md"
+         with open(meta_review_file, "w") as f:
+             f.write(meta_review_text)
+         click.echo(f"Meta-review saved to {meta_review_file}")
+-        
+-        # Extract concerns table and save as CSV with model names as columns
+-        from .review import GoogleClient
+-        meta_reviewer = GoogleClient(model="gemini-2.5-pro-preview-05-06")
+-        
+-        # Create reverse mapping from NATO code to model name
++
++        # Use the same configured local meta-reviewer to extract a clean
++        # concerns JSON. (Replaces the previous hardcoded Google Gemini call.)
++        meta_reviewer = get_meta_reviewer_client(config_file)
++
++        # Create reverse mapping from NATO code to reviewer name
+         model_names = list(reviews.keys())
+         reviewer_codes = list(nato_to_model.keys())
+-        
+-        # Get custom config path if provided
+-        config_file = ctx.obj.get("config_file")
+-        
++
+         # Get concerns extraction prompt from config
+         prompt_template = get_prompt("concerns_extraction", config_file)
+         if not prompt_template:
+@@ -193,7 +280,7 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+                 "Meta-review:\n{meta_review_text}\n\n"
+                 "Model name mapping (for reference):\n{model_mapping}"
+             )
+-        
++
+         # Format the model names and mapping
+         model_names_str = ', '.join(model_names)
+         first_model = model_names[0] if model_names else ""
+@@ -201,7 +288,7 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+         model_mapping = ""
+         for nato_code, model_name in nato_to_model.items():
+             model_mapping += f"{nato_code}: {model_name}\n"
+-        
++
+         prompt = prompt_template.format(
+             model_names=model_names_str,
+             first_model=first_model,
+@@ -209,7 +296,7 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+             meta_review_text=meta_review_text,
+             model_mapping=model_mapping
+         )
+-        
++
+         json_text = meta_reviewer.generate(prompt)
+         # Extract JSON from response
+         json_match = re.search(r'\{.*\}', json_text, re.DOTALL)
+@@ -220,31 +307,31 @@ def review(ctx, pdf_path, output_dir, meta_review, models, overwrite):
+                 concerns_data = json.loads(json_match.group(0))
+                 if "concerns" in concerns_data:
+                     df = pd.DataFrame(concerns_data["concerns"])
+-                    
++
+                     # Ensure all model columns exist
+                     for model_name in model_names:
+                         if model_name not in df.columns:
+                             df[model_name] = False
+-                    
++
+                     # Save CSV
+                     csv_path = output_dir / "concerns_table.csv"
+                     df.to_csv(csv_path, index=False)
+                     click.echo(f"Concerns table saved to {csv_path}")
+             except Exception as e:
+                 click.echo(f"Error processing concerns table: {e}")
+-        
++
+         # Save everything to JSON
+         result = {
+             "individual_reviews": review_data,
+             "meta_review": meta_review_text,
+             "reviewer_to_model": nato_to_model
+         }
+-        
++
+         json_file = output_dir / "results.json"
+         with open(json_file, "w") as f:
+             json.dump(result, f, indent=2)
+         click.echo(f"All results saved to {json_file}")
+-    
++
+     return reviews
+ 
+ 
+@@ -254,4 +341,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/ai_peer_review/llm_clients/anthropic_client.py b/src/ai_peer_review/llm_clients/anthropic_client.py
+deleted file mode 100755
+index 1ffa572..0000000
+--- a/src/ai_peer_review/llm_clients/anthropic_client.py
++++ /dev/null
+@@ -1,52 +0,0 @@
+-import os
+-from typing import Optional
+-from anthropic import Anthropic
+-
+-from .base_client import BaseLLMClient
+-from ..utils.config import get_api_key, get_prompt
+-
+-
+-class AnthropicClient(BaseLLMClient):
+-    """Client for Anthropic API."""
+-    
+-    def __init__(self, model: str, api_key: Optional[str] = None):
+-        """
+-        Initialize Anthropic client.
+-        
+-        Args:
+-            model: Model name
+-            api_key: Anthropic API key (optional, will use ANTHROPIC_API_KEY env var if not provided)
+-        """
+-        self.model = model
+-        self.api_key = api_key or get_api_key("anthropic")
+-        if not self.api_key:
+-            raise ValueError("Anthropic API key must be provided via the config command, API parameter, or ANTHROPIC_API_KEY environment variable")
+-        
+-        self.client = Anthropic(api_key=self.api_key)
+-    
+-    def generate(self, prompt: str) -> str:
+-        """
+-        Generate response from Anthropic model.
+-        
+-        Args:
+-            prompt: Input prompt
+-            
+-        Returns:
+-            Generated response
+-        """
+-        # Get system prompt from config
+-        system_prompt = get_prompt("system")
+-        if not system_prompt:
+-            system_prompt = "You are a neuroscientist and expert in brain imaging."
+-            
+-        response = self.client.messages.create(
+-            model=self.model,
+-            system=system_prompt,
+-            max_tokens=4000,
+-            temperature=0.1,
+-            messages=[
+-                {"role": "user", "content": prompt}
+-            ]
+-        )
+-        
+-        return response.content[0].text
+\ No newline at end of file
+diff --git a/src/ai_peer_review/llm_clients/deepseek_client.py b/src/ai_peer_review/llm_clients/deepseek_client.py
+deleted file mode 100755
+index f8deed4..0000000
+--- a/src/ai_peer_review/llm_clients/deepseek_client.py
++++ /dev/null
+@@ -1,62 +0,0 @@
+-import os
+-from typing import Optional
+-import requests
+-import json
+-
+-from .base_client import BaseLLMClient
+-from ..utils.config import get_api_key, get_prompt
+-
+-
+-class DeepSeekClient(BaseLLMClient):
+-    """Client for DeepSeek API via Together.ai."""
+-
+-    def __init__(self, model: str, api_key: Optional[str] = None):
+-        """
+-        Initialize DeepSeek client using Together.ai API.
+-
+-        Args:
+-            model: Model name
+-            api_key: Together.ai API key (optional, will use TOGETHER_API_KEY env var if not provided)
+-        """
+-        self.model = "deepseek-ai/deepseek-r1"  # Together.ai model name for DeepSeek
+-        self.api_key = api_key or get_api_key("together")
+-        if not self.api_key:
+-            raise ValueError("Together.ai API key must be provided via the config command, API parameter, or TOGETHER_API_KEY environment variable")
+-
+-        self.api_url = "https://api.together.xyz/v1/chat/completions"
+-        self.headers = {
+-            "Content-Type": "application/json",
+-            "Authorization": f"Bearer {self.api_key}"
+-        }
+-
+-    def generate(self, prompt: str) -> str:
+-        """
+-        Generate response from DeepSeek model via Together.ai.
+-
+-        Args:
+-            prompt: Input prompt
+-
+-        Returns:
+-            Generated response
+-        """
+-        # Get system prompt from config
+-        system_prompt = get_prompt("system")
+-        if not system_prompt:
+-            system_prompt = "You are a neuroscientist and expert in brain imaging."
+-            
+-        payload = {
+-            "model": self.model,
+-            "messages": [
+-                {"role": "system", "content": system_prompt},
+-                {"role": "user", "content": prompt}
+-            ],
+-            "temperature": 0.1,
+-            "max_tokens": 4000
+-        }
+-
+-        response = requests.post(self.api_url, headers=self.headers, data=json.dumps(payload))
+-
+-        if response.status_code != 200:
+-            raise RuntimeError(f"Error from Together.ai API: {response.text}")
+-
+-        return response.json()["choices"][0]["message"]["content"]
+\ No newline at end of file
+diff --git a/src/ai_peer_review/llm_clients/google_client.py b/src/ai_peer_review/llm_clients/google_client.py
+deleted file mode 100755
+index 04d96f6..0000000
+--- a/src/ai_peer_review/llm_clients/google_client.py
++++ /dev/null
+@@ -1,48 +0,0 @@
+-import os
+-from typing import Optional
+-import google.generativeai as genai
+-
+-from .base_client import BaseLLMClient
+-from ..utils.config import get_api_key, get_prompt
+-
+-
+-class GoogleClient(BaseLLMClient):
+-    """Client for Google Gemini API."""
+-    
+-    def __init__(self, model: str, api_key: Optional[str] = None):
+-        """
+-        Initialize Google Gemini client.
+-        
+-        Args:
+-            model: Model name
+-            api_key: Google API key (optional, will use GOOGLE_API_KEY env var if not provided)
+-        """
+-        self.model = model
+-        self.api_key = api_key or get_api_key("google")
+-        if not self.api_key:
+-            raise ValueError("Google API key must be provided via the config command, API parameter, or GOOGLE_API_KEY environment variable")
+-        
+-        genai.configure(api_key=self.api_key)
+-        self.model_obj = genai.GenerativeModel(self.model)
+-    
+-    def generate(self, prompt: str) -> str:
+-        """
+-        Generate response from Google Gemini model.
+-        
+-        Args:
+-            prompt: Input prompt
+-            
+-        Returns:
+-            Generated response
+-        """
+-        # Get system prompt from config
+-        system_instruction = get_prompt("system")
+-        if not system_instruction:
+-            system_instruction = "You are a neuroscientist and expert in brain imaging."
+-        
+-        response = self.model_obj.generate_content(
+-            [system_instruction, prompt],
+-            generation_config=genai.GenerationConfig(temperature=0.1)
+-        )
+-        
+-        return response.text
+\ No newline at end of file
+diff --git a/src/ai_peer_review/llm_clients/llama_client.py b/src/ai_peer_review/llm_clients/llama_client.py
+deleted file mode 100755
+index eeea94b..0000000
+--- a/src/ai_peer_review/llm_clients/llama_client.py
++++ /dev/null
+@@ -1,62 +0,0 @@
+-import os
+-from typing import Optional
+-import requests
+-import json
+-
+-from .base_client import BaseLLMClient
+-from ..utils.config import get_api_key, get_prompt
+-
+-
+-class LlamaClient(BaseLLMClient):
+-    """Client for Llama models via Together.ai."""
+-
+-    def __init__(self, model: str, api_key: Optional[str] = None):
+-        """
+-        Initialize Llama client using Together.ai API.
+-
+-        Args:
+-            model: Model name (used for identification only)
+-            api_key: Together.ai API key (optional, will use TOGETHER_API_KEY env var if not provided)
+-        """
+-        self.model = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"  # Together.ai model name for Llama 4 Maverick
+-        self.api_key = api_key or get_api_key("together")
+-        if not self.api_key:
+-            raise ValueError("Together.ai API key must be provided via the config command, API parameter, or TOGETHER_API_KEY environment variable")
+-
+-        self.api_url = "https://api.together.xyz/v1/chat/completions"
+-        self.headers = {
+-            "Content-Type": "application/json",
+-            "Authorization": f"Bearer {self.api_key}"
+-        }
+-
+-    def generate(self, prompt: str) -> str:
+-        """
+-        Generate response from Llama model via Together.ai.
+-
+-        Args:
+-            prompt: Input prompt
+-
+-        Returns:
+-            Generated response
+-        """
+-        # Get system prompt from config
+-        system_prompt = get_prompt("system")
+-        if not system_prompt:
+-            system_prompt = "You are a neuroscientist and expert in brain imaging."
+-            
+-        payload = {
+-            "model": self.model,
+-            "messages": [
+-                {"role": "system", "content": system_prompt},
+-                {"role": "user", "content": prompt}
+-            ],
+-            "temperature": 0.1,
+-            "max_tokens": 4000
+-        }
+-
+-        response = requests.post(self.api_url, headers=self.headers, data=json.dumps(payload))
+-
+-        if response.status_code != 200:
+-            raise RuntimeError(f"Error from Together.ai API: {response.text}")
+-
+-        return response.json()["choices"][0]["message"]["content"]
+\ No newline at end of file
+diff --git a/src/ai_peer_review/llm_clients/local_client.py b/src/ai_peer_review/llm_clients/local_client.py
+new file mode 100644
+index 0000000..09c61eb
+--- /dev/null
++++ b/src/ai_peer_review/llm_clients/local_client.py
+@@ -0,0 +1,115 @@
++import os
++from typing import Optional
++
++from openai import OpenAI
++
++from .base_client import BaseLLMClient
++from ..utils.config import get_local_server_config, get_prompt
++
++
++class LocalLLMClient(BaseLLMClient):
++    """Client for a locally-served LLM that exposes an OpenAI-compatible API.
++
++    This client replaces the original cloud-API clients (OpenAI, Anthropic,
++    Google, Together.ai). It never contacts a third-party LLM provider: the
++    ``base_url`` points at an inference server that *you* run yourself, so the
++    manuscript text never leaves a machine you control. This is the intended
++    mode for peer review of unpublished work.
++
++    It works with any local server that implements the OpenAI
++    ``/v1/chat/completions`` endpoint, including:
++
++    - **Ollama**        (default ``http://localhost:11434/v1``)
++    - **LM Studio**     (``http://localhost:1234/v1``)
++    - **llama.cpp** ``llama-server`` (``http://localhost:8080/v1``)
++    - **vLLM**          (``http://localhost:8000/v1``)
++    - **LocalAI**, **text-generation-webui** (OpenAI extension), **TGI** (with
++      ``--chat-template``), and any other OpenAI-compatible server.
++
++    No real API key is required: local servers ignore the ``Authorization``
++    header, but the OpenAI Python SDK requires a non-empty string, so the
++    placeholder ``"local"`` is sent by default.
++    """
++
++    def __init__(
++        self,
++        model: str,
++        base_url: Optional[str] = None,
++        api_key: Optional[str] = None,
++        temperature: float = 0.1,
++        max_tokens: int = 8000,
++        timeout: Optional[float] = None,
++    ):
++        """
++        Initialize the local LLM client.
++
++        Args:
++            model: Model tag as recognized by the local server
++                (e.g. ``"qwen3:32b"``, ``"deepseek-r1:70b"``).
++            base_url: Base URL of the OpenAI-compatible local server. If
++                ``None``, falls back to the ``AI_PEER_REVIEW_BASE_URL`` env
++                var, then to ``local_server.base_url`` in the config, then to
++                the Ollama default.
++            api_key: Placeholder API key. If ``None``, falls back to the
++                ``AI_PEER_REVIEW_API_KEY`` env var, then to
++                ``local_server.api_key`` in the config, then to ``"local"``.
++            temperature: Sampling temperature (low for reproducible reviews).
++            max_tokens: Maximum tokens to generate. Default 8000 (raised from
++                the original 4000) because local long-context models can and
++                should produce full-length peer reviews.
++            timeout: Per-request timeout in seconds. ``None`` uses the OpenAI
++                SDK default. Local inference on large models can be slow, so
++                you may want to raise this (e.g. 600) for very large models.
++        """
++        self.model = model
++
++        server_cfg = get_local_server_config()
++        self.base_url = (
++            base_url
++            or os.environ.get("AI_PEER_REVIEW_BASE_URL")
++            or server_cfg.get("base_url")
++            or "http://localhost:11434/v1"
++        )
++        self.api_key = (
++            api_key
++            or os.environ.get("AI_PEER_REVIEW_API_KEY")
++            or server_cfg.get("api_key")
++            or "local"
++        )
++        self.temperature = temperature
++        self.max_tokens = max_tokens
++        self.timeout = timeout
++
++        self.client = OpenAI(
++            base_url=self.base_url,
++            api_key=self.api_key,
++            timeout=timeout,
++        )
++
++    def generate(self, prompt: str) -> str:
++        """
++        Generate a response from the local LLM.
++
++        Args:
++            prompt: Input prompt (the user message).
++
++        Returns:
++            Generated response text.
++        """
++        # The system prompt is read from the config so the scientific-validity
++        # profile (configs/scientific-only.json) overrides the default persona.
++        system_prompt = get_prompt("system")
++        if not system_prompt:
++            system_prompt = "You are a neuroscientist and expert in brain imaging."
++
++        response = self.client.chat.completions.create(
++            model=self.model,
++            messages=[
++                {"role": "system", "content": system_prompt},
++                {"role": "user", "content": prompt},
++            ],
++            temperature=self.temperature,
++            max_tokens=self.max_tokens,
++        )
++
++        return (response.choices[0].message.content or "").strip()
+diff --git a/src/ai_peer_review/llm_clients/openai_client.py b/src/ai_peer_review/llm_clients/openai_client.py
+deleted file mode 100755
+index 2c43ff0..0000000
+--- a/src/ai_peer_review/llm_clients/openai_client.py
++++ /dev/null
+@@ -1,51 +0,0 @@
+-import os
+-from typing import Optional
+-from openai import OpenAI
+-
+-from .base_client import BaseLLMClient
+-from ..utils.config import get_api_key, get_prompt
+-
+-
+-class OpenAIClient(BaseLLMClient):
+-    """Client for OpenAI API."""
+-    
+-    def __init__(self, model: str, api_key: Optional[str] = None):
+-        """
+-        Initialize OpenAI client.
+-        
+-        Args:
+-            model: Model name
+-            api_key: OpenAI API key (optional, will use OPENAI_API_KEY env var if not provided)
+-        """
+-        self.model = model
+-        self.api_key = api_key or get_api_key("openai")
+-        if not self.api_key:
+-            raise ValueError("OpenAI API key must be provided via the config command, API parameter, or OPENAI_API_KEY environment variable")
+-        
+-        self.client = OpenAI(api_key=self.api_key)
+-    
+-    def generate(self, prompt: str) -> str:
+-        """
+-        Generate response from OpenAI model.
+-        
+-        Args:
+-            prompt: Input prompt
+-            
+-        Returns:
+-            Generated response
+-        """
+-        # Get system prompt from config
+-        system_prompt = get_prompt("system")
+-        if not system_prompt:
+-            system_prompt = "You are a neuroscientist and expert in brain imaging."
+-            
+-        response = self.client.chat.completions.create(
+-            model=self.model,
+-            messages=[
+-                {"role": "system", "content": system_prompt},
+-                {"role": "user", "content": prompt}
+-            ],
+-            temperature=0.1,
+-        )
+-        
+-        return response.choices[0].message.content.strip()
+\ No newline at end of file
+diff --git a/src/ai_peer_review/review.py b/src/ai_peer_review/review.py
+index 6c7f334..ebef232 100755
+--- a/src/ai_peer_review/review.py
++++ b/src/ai_peer_review/review.py
+@@ -1,28 +1,42 @@
+-import os
+ import re
+-from typing import Dict, List, Tuple, Any, Optional
++from typing import Dict, List, Tuple, Optional
+ from pathlib import Path
+ import json
+-import random
+ import pandas as pd
+ 
+ from .utils.pdf import extract_text_from_pdf
+-from .utils.config import get_prompt
+-from .llm_clients.openai_client import OpenAIClient
+-from .llm_clients.anthropic_client import AnthropicClient
+-from .llm_clients.google_client import GoogleClient
+-from .llm_clients.deepseek_client import DeepSeekClient
+-from .llm_clients.llama_client import LlamaClient
++from .utils.config import (
++    get_prompt,
++    get_local_models,
++    get_local_server_config,
++    get_meta_reviewer_config,
++)
++from .llm_clients.local_client import LocalLLMClient
++
++
++def _build_local_client(cfg: Dict, config_file: Optional[str] = None) -> LocalLLMClient:
++    """Build a LocalLLMClient from a config entry, inheriting local_server
++    defaults for any field the entry leaves as ``None`` (or omits)."""
++    server = get_local_server_config(config_file)
++    base_url = cfg.get("base_url") or server.get("base_url") or "http://localhost:11434/v1"
++    api_key = cfg.get("api_key") or server.get("api_key") or "local"
++    return LocalLLMClient(
++        model=cfg["model"],
++        base_url=base_url,
++        api_key=api_key,
++        temperature=cfg.get("temperature", 0.1),
++        max_tokens=cfg.get("max_tokens", 8000),
++    )
+ 
+ 
+ def get_review_prompt(paper_text: str, config_file: Optional[str] = None) -> str:
+     """
+     Generate the prompt for peer review.
+-    
++
+     Args:
+         paper_text: The text of the paper to review
+         config_file: Optional path to a custom config file
+-    
++
+     Returns:
+         The formatted prompt string
+     """
+@@ -37,30 +51,30 @@ def get_review_prompt(paper_text: str, config_file: Optional[str] = None) -> str
+             "a detailed point-by-point analysis of any flaws in the study.\n\n"
+             "Here is the paper to review:\n\n{paper_text}"
+         )
+-    
++
+     return prompt_template.format(paper_text=paper_text)
+ 
+ 
+ def get_metareview_prompt(reviews: List[str], config_file: Optional[str] = None) -> str:
+     """
+     Generate the prompt for meta-review.
+-    
++
+     Args:
+         reviews: List of review texts
+         config_file: Optional path to a custom config file
+-        
++
+     Returns:
+         The formatted meta-review prompt
+     """
+     # NATO phonetic alphabet for reviewers
+     nato_names = ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
+-    
++
+     # Build reviews text with NATO phonetic names
+     reviews_text = ""
+     for i, review in enumerate(reviews):
+         reviewer_name = nato_names[i] if i < len(nato_names) else f"reviewer_{i+1}"
+         reviews_text += f"Review from {reviewer_name}:\n\n{review}\n\n"
+-    
++
+     # Get prompt template from config
+     prompt_template = get_prompt("metareview", config_file)
+     if not prompt_template:
+@@ -90,46 +104,59 @@ def get_metareview_prompt(reviews: List[str], config_file: Optional[str] = None)
+             "(e.g., alfa, bravo, charlie) throughout your meta-review.\n\n"
+             "{reviews_text}"
+         )
+-    
++
+     return prompt_template.format(reviews_text=reviews_text)
+ 
+ 
++def get_client_factories(config_file: Optional[str] = None) -> Dict[str, callable]:
++    """Build a {reviewer_name: client_factory} mapping from the configured
++    local models. Each factory is only instantiated on demand (so unused
++    reviewers never open a connection)."""
++    models = get_local_models(config_file)
++    return {
++        name: (lambda cfg=cfg: _build_local_client(cfg, config_file))
++        for name, cfg in models.items()
++    }
++
++
++def get_meta_reviewer_client(config_file: Optional[str] = None) -> LocalLLMClient:
++    """Build the LocalLLMClient used for the meta-review and the
++    concerns-extraction JSON call. Driven by the ``meta_reviewer`` config
++    section so the meta-reviewer can be a different (stronger / longer-context)
++    model than the individual reviewers."""
++    return _build_local_client(get_meta_reviewer_config(config_file), config_file)
++
++
+ def process_paper(pdf_path: str, models: List[str], config_file: Optional[str] = None) -> Dict[str, str]:
+     """
+-    Process a paper and generate reviews using multiple LLMs.
+-    
++    Process a paper and generate reviews using multiple local LLMs.
++
+     Args:
+         pdf_path: Path to the PDF file to process
+-        models: List of model names to use for reviews
++        models: List of reviewer names (keys of ``local_models`` in the config)
++            to use for reviews
+         config_file: Optional path to a custom config file
+-        
++
+     Returns:
+-        Dictionary mapping model names to their review texts
++        Dictionary mapping reviewer names to their review texts
+     """
+     # Extract text from PDF
+     paper_text = extract_text_from_pdf(pdf_path)
+-    
++
+     # Generate the review prompt
+     prompt = get_review_prompt(paper_text, config_file)
+-    
+-    # Define client factories for each model
+-    client_factories = {
+-        "gpt4-o1": lambda: OpenAIClient(model="gpt-4o"),
+-        "gpt4-o3-mini": lambda: OpenAIClient(model="gpt-4o-mini"),
+-        "claude-3.7-sonnet": lambda: AnthropicClient(model="claude-3-sonnet-20240229"),
+-        "gemini-2.5-pro": lambda: GoogleClient(model="gemini-2.5-pro-preview-05-06"),
+-        "deepseek-r1": lambda: DeepSeekClient(model="deepseek-r1"),
+-        "llama-4-maverick": lambda: LlamaClient(model="llama-4-maverick")
+-    }
+-    
+-    # Get reviews from each LLM
++
++    # Build client factories from the configured local models
++    client_factories = get_client_factories(config_file)
++
++    # Get reviews from each requested local LLM
+     reviews = {}
+     for model_name in models:
+         if model_name in client_factories:
+             # Only initialize the client if the model is requested
+             client = client_factories[model_name]()
+             reviews[model_name] = client.generate(prompt)
+-    
++
+     return reviews
+ 
+ 
+@@ -138,17 +165,17 @@ def extract_concerns_table(meta_review_text: str) -> Optional[Dict]:
+     # Look for JSON data between CONCERNS_TABLE_DATA section and the end of a JSON block
+     pattern = r'CONCERNS_TABLE_DATA.*?```json\s*(.*?)\s*```'
+     match = re.search(pattern, meta_review_text, re.DOTALL)
+-    
++
+     if not match:
+         # Try without the json tag in case the model formatted it differently
+         pattern = r'CONCERNS_TABLE_DATA.*?```\s*(.*?)\s*```'
+         match = re.search(pattern, meta_review_text, re.DOTALL)
+-    
++
+     if not match:
+         # Try finding a JSON object with "concerns" key anywhere in the text
+         pattern = r'\{\s*"concerns"\s*:\s*\[.*?\]\s*\}'
+         match = re.search(pattern, meta_review_text, re.DOTALL)
+-    
++
+     if match:
+         try:
+             json_str = match.group(1)
+@@ -163,56 +190,58 @@ def extract_concerns_table(meta_review_text: str) -> Optional[Dict]:
+ 
+ def generate_meta_review(reviews: Dict[str, str], config_file: Optional[str] = None) -> Tuple[str, Dict[str, str]]:
+     """
+-    Generate a meta-review of all reviews.
+-    
++    Generate a meta-review of all reviews using the configured local
++    meta-reviewer model.
++
+     Args:
+-        reviews: Dictionary mapping model names to their review texts
++        reviews: Dictionary mapping reviewer names to their review texts
+         config_file: Optional path to a custom config file
+-        
++
+     Returns:
+-        Tuple of (meta-review text, NATO-to-model mapping)
++        Tuple of (meta-review text, NATO-to-reviewer mapping)
+     """
+     # NATO phonetic alphabet for reviewers
+     nato_names = ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
+-    
+-    # Get list of models in a fixed order
++
++    # Get list of reviewers in a fixed order
+     models_list = list(reviews.keys())
+-    
+-    # Remove LLM identifiers but maintain order for mapping
++
++    # Remove reviewer identifiers but maintain order for mapping
+     anonymized_reviews = [reviews[model] for model in models_list]
+-    
+-    # Create mapping of NATO name to model name
++
++    # Create mapping of NATO name to reviewer name
+     nato_to_model = {nato_names[i]: model for i, model in enumerate(models_list) if i < len(nato_names)}
+-    # Handle any extras if we have more than 10 models
++    # Handle any extras if we have more than 10 reviewers
+     for i, model in enumerate(models_list[len(nato_names):], len(nato_names)):
+         nato_to_model[f"reviewer_{i+1}"] = model
+-    
++
+     # Generate meta-review prompt
+     prompt = get_metareview_prompt(anonymized_reviews, config_file)
+-    
+-    # Use Google Gemini for meta-review
+-    meta_reviewer = GoogleClient(model="gemini-2.5-pro-preview-05-06")
++
++    # Use the configured local meta-reviewer (replaces the previous hardcoded
++    # Google Gemini client). No third-party API is contacted.
++    meta_reviewer = get_meta_reviewer_client(config_file)
+     meta_review_text = meta_reviewer.generate(prompt)
+-    
++
+     # Filter out the CONCERNS_TABLE_DATA section from the meta-review
+     clean_meta_review = re.sub(r'CONCERNS_TABLE_DATA.*', '', meta_review_text, flags=re.DOTALL)
+-    
++
+     return clean_meta_review, nato_to_model
+ 
+ 
+ def save_concerns_as_csv(meta_review_text: str, output_path: Path) -> bool:
+     """Extract concerns from meta-review and save as CSV."""
+     concerns_data = extract_concerns_table(meta_review_text)
+-    
++
+     if not concerns_data or "concerns" not in concerns_data:
+         print("No valid concerns table found in meta-review")
+         return False
+-    
++
+     # Convert to DataFrame
+     df = pd.DataFrame(concerns_data["concerns"])
+-    
++
+     # Save to CSV
+     csv_path = output_path / "concerns_table.csv"
+     df.to_csv(csv_path, index=False)
+     print(f"Concerns table saved to {csv_path}")
+-    return True
+\ No newline at end of file
++    return True
+diff --git a/src/ai_peer_review/utils/config.py b/src/ai_peer_review/utils/config.py
+index 85ff3b9..4c13c2d 100755
+--- a/src/ai_peer_review/utils/config.py
++++ b/src/ai_peer_review/utils/config.py
+@@ -40,9 +40,49 @@ def get_config_path(custom_path: Optional[str] = None) -> Path:
+ 
+ 
+ def get_default_config() -> Dict[str, Any]:
+-    """Return the default configuration."""
++    """Return the default configuration.
++
++    The default ships a single local reviewer plus a meta-reviewer, both
++    pointing at a local Ollama instance. Add more entries under
++    ``local_models`` (each can point at a different model or a different
++    server) to get genuine multi-perspective review.
++    """
+     return {
+         "api_keys": {},
++        "local_server": {
++            # Default OpenAI-compatible local server. Ollama's port is 11434.
++            # LM Studio uses http://localhost:1234/v1, llama.cpp uses 8080,
++            # vLLM uses 8000. Change this once and every reviewer inherits it
++            # unless the reviewer overrides "base_url".
++            "base_url": "http://localhost:11434/v1",
++            # Local servers ignore this value, but the OpenAI SDK requires a
++            # non-empty string.
++            "api_key": "local",
++        },
++        "local_models": {
++            # Each entry is one "reviewer". The key is the friendly name shown
++            # by `ai-peer-review list-models` and accepted by --models.
++            # Default tag is qwen3:32b (strong reasoning, fits a single 24GB
++            # GPU in 4-bit). See README for stronger alternatives.
++            "reviewer-1": {
++                "model": "qwen3:32b",
++                "base_url": None,   # None => inherit local_server.base_url
++                "api_key": None,    # None => inherit local_server.api_key
++                "temperature": 0.1,
++                "max_tokens": 8000,
++            }
++        },
++        "meta_reviewer": {
++            # Used for the meta-review and the concerns-extraction JSON call.
++            # Point this at your strongest available model with the longest
++            # context (the meta-review input is all individual reviews
++            # concatenated).
++            "model": "qwen3:32b",
++            "base_url": None,
++            "api_key": None,
++            "temperature": 0.1,
++            "max_tokens": 8000,
++        },
+         "prompts": {
+             "system": "You are a neuroscientist and expert in brain imaging.",
+             "review": (
+@@ -198,13 +238,122 @@ def set_api_key(key_name: str, api_key: str, config_file: Optional[str] = None)
+ def get_prompt(prompt_name: str, config_file: Optional[str] = None) -> str:
+     """
+     Get a prompt from the configuration file.
+-    
++
+     Args:
+         prompt_name: Name of the prompt (e.g., 'system', 'review', 'metareview')
+-        config_file: Optional path to a custom config file
+-        
++        config_file: Optional path to the config file
++
+     Returns:
+         Prompt template string if found, empty string otherwise
+     """
+     config = load_config(config_file)
+-    return config.get("prompts", {}).get(prompt_name, "")
+\ No newline at end of file
++    return config.get("prompts", {}).get(prompt_name, "")
++
++
++def get_local_server_config(config_file: Optional[str] = None) -> Dict[str, Any]:
++    """Return the default local-server settings (base_url, api_key).
++
++    Individual reviewers and the meta-reviewer inherit these unless they
++    override ``base_url`` / ``api_key`` themselves.
++    """
++    config = load_config(config_file)
++    return config.get("local_server", {}) or {}
++
++
++def set_local_server(
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++    config_file: Optional[str] = None,
++) -> None:
++    """Update the default local-server settings. Only non-None fields are changed."""
++    config = load_config(config_file)
++    config_path = get_config_path(config_file)
++    server = config.setdefault("local_server", {})
++    if base_url is not None:
++        server["base_url"] = base_url
++    if api_key is not None:
++        server["api_key"] = api_key
++    save_config(config, config_path)
++
++
++def get_local_models(config_file: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
++    """Return the configured local reviewer models as ``{name: cfg}``."""
++    config = load_config(config_file)
++    models = config.get("local_models", {})
++    if not isinstance(models, dict) or not models:
++        # Fall back to the default reviewer so the tool always has something
++        # to run even on a fresh / hand-edited config.
++        return get_default_config()["local_models"]
++    return models
++
++
++def set_local_model(
++    name: str,
++    model: str,
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++    temperature: Optional[float] = None,
++    max_tokens: Optional[int] = None,
++    config_file: Optional[str] = None,
++) -> None:
++    """Add or update a local reviewer model entry."""
++    config = load_config(config_file)
++    config_path = get_config_path(config_file)
++    models = config.setdefault("local_models", {})
++    entry = models.get(name, {})
++    entry["model"] = model
++    if base_url is not None:
++        entry["base_url"] = base_url
++    if api_key is not None:
++        entry["api_key"] = api_key
++    if temperature is not None:
++        entry["temperature"] = temperature
++    if max_tokens is not None:
++        entry["max_tokens"] = max_tokens
++    models[name] = entry
++    save_config(config, config_path)
++
++
++def remove_local_model(name: str, config_file: Optional[str] = None) -> bool:
++    """Remove a local reviewer model entry. Returns True if it existed."""
++    config = load_config(config_file)
++    config_path = get_config_path(config_file)
++    models = config.get("local_models", {})
++    if name in models:
++        del models[name]
++        save_config(config, config_path)
++        return True
++    return False
++
++
++def get_meta_reviewer_config(config_file: Optional[str] = None) -> Dict[str, Any]:
++    """Return the meta-reviewer model config."""
++    config = load_config(config_file)
++    meta = config.get("meta_reviewer", {})
++    if not isinstance(meta, dict) or not meta:
++        return get_default_config()["meta_reviewer"]
++    return meta
++
++
++def set_meta_reviewer(
++    model: str,
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++    temperature: Optional[float] = None,
++    max_tokens: Optional[int] = None,
++    config_file: Optional[str] = None,
++) -> None:
++    """Update the meta-reviewer model entry."""
++    config = load_config(config_file)
++    config_path = get_config_path(config_file)
++    meta = config.setdefault("meta_reviewer", {})
++    meta["model"] = model
++    if base_url is not None:
++        meta["base_url"] = base_url
++    if api_key is not None:
++        meta["api_key"] = api_key
++    if temperature is not None:
++        meta["temperature"] = temperature
++    if max_tokens is not None:
++        meta["max_tokens"] = max_tokens
++    save_config(config, config_path)
+\ No newline at end of file
+diff --git a/tests/llm_clients/test_anthropic_client.py b/tests/llm_clients/test_anthropic_client.py
+deleted file mode 100755
+index 315345f..0000000
+--- a/tests/llm_clients/test_anthropic_client.py
++++ /dev/null
+@@ -1,94 +0,0 @@
+-import pytest
+-from unittest.mock import patch, MagicMock
+-
+-from ai_peer_review.llm_clients.anthropic_client import AnthropicClient
+-from ai_peer_review.llm_clients.base_client import BaseLLMClient
+-
+-
+-class TestAnthropicClient:
+-    def test_anthropic_client_inheritance(self):
+-        # Verify that AnthropicClient inherits from BaseLLMClient
+-        assert issubclass(AnthropicClient, BaseLLMClient)
+-    
+-    @patch('ai_peer_review.llm_clients.anthropic_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.anthropic_client.Anthropic')
+-    def test_init_with_provided_api_key(self, mock_anthropic, mock_get_api_key):
+-        # Test initialization with a provided API key
+-        client = AnthropicClient(model="claude-3", api_key="test-key")
+-        
+-        # Check that get_api_key was not called
+-        mock_get_api_key.assert_not_called()
+-        
+-        # Check that Anthropic was initialized with the correct API key
+-        mock_anthropic.assert_called_once_with(api_key="test-key")
+-        
+-        # Check that the model was set correctly
+-        assert client.model == "claude-3"
+-        assert client.api_key == "test-key"
+-    
+-    @patch('ai_peer_review.llm_clients.anthropic_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.anthropic_client.Anthropic')
+-    def test_init_with_config_api_key(self, mock_anthropic, mock_get_api_key):
+-        # Mock get_api_key to return a predefined key
+-        mock_get_api_key.return_value = "config-key"
+-        
+-        # Test initialization without an API key
+-        client = AnthropicClient(model="claude-3")
+-        
+-        # Check that get_api_key was called with the correct key name
+-        mock_get_api_key.assert_called_once_with("anthropic")
+-        
+-        # Check that Anthropic was initialized with the correct API key
+-        mock_anthropic.assert_called_once_with(api_key="config-key")
+-        
+-        # Check that the model was set correctly
+-        assert client.model == "claude-3"
+-        assert client.api_key == "config-key"
+-    
+-    @patch('ai_peer_review.llm_clients.anthropic_client.get_api_key')
+-    def test_init_without_api_key(self, mock_get_api_key):
+-        # Mock get_api_key to return None (no API key available)
+-        mock_get_api_key.return_value = None
+-        
+-        # Test initialization without an API key should raise ValueError
+-        with pytest.raises(ValueError):
+-            AnthropicClient(model="claude-3")
+-    
+-    @patch('ai_peer_review.llm_clients.anthropic_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.anthropic_client.Anthropic')
+-    def test_generate(self, mock_anthropic, mock_get_api_key):
+-        # Mock get_api_key to return a predefined key
+-        mock_get_api_key.return_value = "test-key"
+-        
+-        # Mock the Anthropic client and response
+-        mock_anthropic_instance = MagicMock()
+-        mock_messages = MagicMock()
+-        mock_anthropic_instance.messages.create = mock_messages
+-        
+-        # Set up the response
+-        mock_content = MagicMock()
+-        mock_content.text = "Generated response"
+-        mock_response = MagicMock()
+-        mock_response.content = [mock_content]
+-        mock_messages.return_value = mock_response
+-        
+-        # Set up the mock Anthropic class to return our mock instance
+-        mock_anthropic.return_value = mock_anthropic_instance
+-        
+-        # Create the client and generate a response
+-        client = AnthropicClient(model="claude-3")
+-        response = client.generate("Test prompt")
+-        
+-        # Check that messages.create was called with the correct arguments
+-        mock_messages.assert_called_once_with(
+-            model="claude-3",
+-            system="You are a neuroscientist and expert in brain imaging.",
+-            max_tokens=4000,
+-            temperature=0.1,
+-            messages=[
+-                {"role": "user", "content": "Test prompt"}
+-            ]
+-        )
+-        
+-        # Check that the response is correct
+-        assert response == "Generated response"
+\ No newline at end of file
+diff --git a/tests/llm_clients/test_local_client.py b/tests/llm_clients/test_local_client.py
+new file mode 100644
+index 0000000..52c42ce
+--- /dev/null
++++ b/tests/llm_clients/test_local_client.py
+@@ -0,0 +1,110 @@
++import pytest
++from unittest.mock import patch, MagicMock
++
++from ai_peer_review.llm_clients.local_client import LocalLLMClient
++from ai_peer_review.llm_clients.base_client import BaseLLMClient
++
++
++class TestLocalLLMClient:
++    def test_local_client_inheritance(self):
++        # LocalLLMClient must implement the BaseLLMClient contract
++        assert issubclass(LocalLLMClient, BaseLLMClient)
++
++    @patch('ai_peer_review.llm_clients.local_client.get_local_server_config')
++    @patch('ai_peer_review.llm_clients.local_client.OpenAI')
++    def test_init_with_explicit_args(self, mock_openai, mock_server_cfg):
++        # No config / env lookup should happen when everything is passed
++        mock_server_cfg.return_value = {}
++        client = LocalLLMClient(
++            model="qwen3:32b",
++            base_url="http://localhost:11434/v1",
++            api_key="local",
++            temperature=0.2,
++            max_tokens=4096,
++        )
++
++        # The OpenAI SDK is pointed at the local base_url (not api.openai.com)
++        mock_openai.assert_called_once()
++        _, kwargs = mock_openai.call_args
++        assert kwargs["base_url"] == "http://localhost:11434/v1"
++        assert kwargs["api_key"] == "local"
++
++        assert client.model == "qwen3:32b"
++        assert client.base_url == "http://localhost:11434/v1"
++        assert client.api_key == "local"
++        assert client.temperature == 0.2
++        assert client.max_tokens == 4096
++
++    @patch('ai_peer_review.llm_clients.local_client.get_local_server_config')
++    @patch('ai_peer_review.llm_clients.local_client.OpenAI')
++    def test_init_inherits_server_defaults(self, mock_openai, mock_server_cfg):
++        # When base_url/api_key are omitted, the client inherits them from the
++        # local_server config section.
++        mock_server_cfg.return_value = {
++            "base_url": "http://localhost:1234/v1",
++            "api_key": "lm-studio",
++        }
++        client = LocalLLMClient(model="llama3.3:70b")
++
++        assert client.base_url == "http://localhost:1234/v1"
++        assert client.api_key == "lm-studio"
++        _, kwargs = mock_openai.call_args
++        assert kwargs["base_url"] == "http://localhost:1234/v1"
++        assert kwargs["api_key"] == "lm-studio"
++
++    @patch.dict('os.environ', {
++        "AI_PEER_REVIEW_BASE_URL": "http://env-host:8080/v1",
++        "AI_PEER_REVIEW_API_KEY": "env-key",
++    })
++    @patch('ai_peer_review.llm_clients.local_client.get_local_server_config')
++    @patch('ai_peer_review.llm_clients.local_client.OpenAI')
++    def test_init_reads_env_vars(self, mock_openai, mock_server_cfg):
++        # Env vars take precedence over config defaults
++        mock_server_cfg.return_value = {
++            "base_url": "http://from-config:11434/v1",
++            "api_key": "from-config",
++        }
++        client = LocalLLMClient(model="gemma3:27b")
++
++        assert client.base_url == "http://env-host:8080/v1"
++        assert client.api_key == "env-key"
++
++    @patch('ai_peer_review.llm_clients.local_client.get_local_server_config')
++    @patch('ai_peer_review.llm_clients.local_client.OpenAI')
++    def test_generate_sends_chat_completion(self, mock_openai, mock_server_cfg):
++        mock_server_cfg.return_value = {}
++        # Build a fake OpenAI client whose .chat.completions.create returns a
++        # response with one choice.
++        mock_message = MagicMock()
++        mock_message.content = "  Generated review  "
++        mock_choice = MagicMock()
++        mock_choice.message = mock_message
++        mock_response = MagicMock()
++        mock_response.choices = [mock_choice]
++
++        mock_create = MagicMock(return_value=mock_response)
++        mock_instance = MagicMock()
++        mock_instance.chat.completions.create = mock_create
++        mock_openai.return_value = mock_instance
++
++        with patch('ai_peer_review.llm_clients.local_client.get_prompt',
++                   return_value="You are a neuroscientist and expert in brain imaging."):
++            client = LocalLLMClient(
++                model="qwen3:32b",
++                base_url="http://localhost:11434/v1",
++                api_key="local",
++            )
++            response = client.generate("Review this paper.")
++
++        # The request hits the local model with system+user messages
++        mock_create.assert_called_once()
++        _, kwargs = mock_create.call_args
++        assert kwargs["model"] == "qwen3:32b"
++        assert kwargs["messages"] == [
++            {"role": "system", "content": "You are a neuroscientist and expert in brain imaging."},
++            {"role": "user", "content": "Review this paper."},
++        ]
++        assert kwargs["temperature"] == 0.1
++
++        # The response is stripped of surrounding whitespace
++        assert response == "Generated review"
+diff --git a/tests/llm_clients/test_openai_client.py b/tests/llm_clients/test_openai_client.py
+deleted file mode 100755
+index 957186b..0000000
+--- a/tests/llm_clients/test_openai_client.py
++++ /dev/null
+@@ -1,103 +0,0 @@
+-import pytest
+-from unittest.mock import patch, MagicMock
+-
+-from ai_peer_review.llm_clients.openai_client import OpenAIClient
+-from ai_peer_review.llm_clients.base_client import BaseLLMClient
+-
+-
+-class TestOpenAIClient:
+-    def test_openai_client_inheritance(self):
+-        # Verify that OpenAIClient inherits from BaseLLMClient
+-        assert issubclass(OpenAIClient, BaseLLMClient)
+-    
+-    @patch('ai_peer_review.llm_clients.openai_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.openai_client.OpenAI')
+-    def test_init_with_provided_api_key(self, mock_openai, mock_get_api_key):
+-        # Test initialization with a provided API key
+-        client = OpenAIClient(model="gpt-4o", api_key="test-key")
+-        
+-        # Check that get_api_key was not called
+-        mock_get_api_key.assert_not_called()
+-        
+-        # Check that OpenAI was initialized with the correct API key
+-        mock_openai.assert_called_once_with(api_key="test-key")
+-        
+-        # Check that the model was set correctly
+-        assert client.model == "gpt-4o"
+-        assert client.api_key == "test-key"
+-    
+-    @patch('ai_peer_review.llm_clients.openai_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.openai_client.OpenAI')
+-    def test_init_with_config_api_key(self, mock_openai, mock_get_api_key):
+-        # Mock get_api_key to return a predefined key
+-        mock_get_api_key.return_value = "config-key"
+-        
+-        # Test initialization without an API key
+-        client = OpenAIClient(model="gpt-4o")
+-        
+-        # Check that get_api_key was called with the correct key name
+-        mock_get_api_key.assert_called_once_with("openai")
+-        
+-        # Check that OpenAI was initialized with the correct API key
+-        mock_openai.assert_called_once_with(api_key="config-key")
+-        
+-        # Check that the model was set correctly
+-        assert client.model == "gpt-4o"
+-        assert client.api_key == "config-key"
+-    
+-    @patch('ai_peer_review.llm_clients.openai_client.get_api_key')
+-    def test_init_without_api_key(self, mock_get_api_key):
+-        # Mock get_api_key to return None (no API key available)
+-        mock_get_api_key.return_value = None
+-        
+-        # Test initialization without an API key should raise ValueError
+-        with pytest.raises(ValueError):
+-            OpenAIClient(model="gpt-4o")
+-    
+-    @patch('ai_peer_review.llm_clients.openai_client.get_api_key')
+-    @patch('ai_peer_review.llm_clients.openai_client.OpenAI')
+-    def test_generate(self, mock_openai, mock_get_api_key):
+-        # Mock get_api_key to return a predefined key
+-        mock_get_api_key.return_value = "test-key"
+-        
+-        # Mock the OpenAI client and response
+-        mock_openai_instance = MagicMock()
+-        mock_chat = MagicMock()
+-        mock_completions = MagicMock()
+-        mock_create = MagicMock()
+-        
+-        mock_openai_instance.chat = mock_chat
+-        mock_chat.completions = mock_completions
+-        mock_completions.create = mock_create
+-        
+-        # Mock the response
+-        mock_message = MagicMock()
+-        mock_message.content = "Generated response"
+-        
+-        mock_choice = MagicMock()
+-        mock_choice.message = mock_message
+-        
+-        mock_response = MagicMock()
+-        mock_response.choices = [mock_choice]
+-        
+-        mock_create.return_value = mock_response
+-        
+-        # Set up the mock OpenAI class to return our mock instance
+-        mock_openai.return_value = mock_openai_instance
+-        
+-        # Create the client and generate a response
+-        client = OpenAIClient(model="gpt-4o")
+-        response = client.generate("Test prompt")
+-        
+-        # Check that completions.create was called with the correct arguments
+-        mock_create.assert_called_once_with(
+-            model="gpt-4o",
+-            messages=[
+-                {"role": "system", "content": "You are a neuroscientist and expert in brain imaging."},
+-                {"role": "user", "content": "Test prompt"}
+-            ],
+-            temperature=0.1,
+-        )
+-        
+-        # Check that the response is correct
+-        assert response == "Generated response"
+\ No newline at end of file
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 4539b87..e71d4d8 100755
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -2,160 +2,171 @@ import pytest
+ import os
+ import json
+ from unittest.mock import patch, MagicMock
+-from pathlib import Path
+ from click.testing import CliRunner
+ 
+-from ai_peer_review.cli import cli, config, review, main
+-import ai_peer_review.review
++from ai_peer_review.cli import cli, main
+ 
+ 
+ class TestCLI:
+     def setup_method(self):
+         self.runner = CliRunner()
+-    
++
+     def test_cli_version(self):
+         # Test that the CLI version option works
+         result = self.runner.invoke(cli, ["--version"])
+         assert result.exit_code == 0
+         assert "version" in result.output.lower()
+-    
+-    @patch('ai_peer_review.cli.set_api_key')
+-    def test_config_command(self, mock_set_api_key):
+-        # Test the config command
+-        result = self.runner.invoke(cli, ["config", "openai", "test-key"])
+-        
+-        # Check that the command exited successfully
++
++    # --- config subcommands -------------------------------------------------
++
++    @patch('ai_peer_review.cli.set_local_model')
++    def test_config_add(self, mock_set_local_model):
++        result = self.runner.invoke(cli, [
++            "config", "add", "reviewer-1", "--model", "qwen3:32b",
++        ])
++        assert result.exit_code == 0
++        mock_set_local_model.assert_called_once()
++        args, kwargs = mock_set_local_model.call_args
++        assert args[0] == "reviewer-1"
++        assert args[1] == "qwen3:32b"
++        assert "reviewer-1" in result.output
++
++    @patch('ai_peer_review.cli.set_local_server')
++    def test_config_server(self, mock_set_local_server):
++        result = self.runner.invoke(cli, [
++            "config", "server", "--base-url", "http://localhost:1234/v1",
++        ])
++        assert result.exit_code == 0
++        mock_set_local_server.assert_called_once()
++        _, kwargs = mock_set_local_server.call_args
++        assert kwargs["base_url"] == "http://localhost:1234/v1"
++        assert "http://localhost:1234/v1" in result.output
++
++    @patch('ai_peer_review.cli.set_meta_reviewer')
++    def test_config_meta(self, mock_set_meta):
++        result = self.runner.invoke(cli, [
++            "config", "meta", "--model", "qwen3:32b",
++        ])
++        assert result.exit_code == 0
++        mock_set_meta.assert_called_once()
++        args, _ = mock_set_meta.call_args
++        assert args[0] == "qwen3:32b"
++
++    @patch('ai_peer_review.cli.remove_local_model', return_value=True)
++    def test_config_remove(self, mock_remove):
++        result = self.runner.invoke(cli, ["config", "remove", "reviewer-1"])
++        assert result.exit_code == 0
++        mock_remove.assert_called_once()
++        assert "removed" in result.output
++
++    @patch('ai_peer_review.cli.load_config')
++    def test_config_show(self, mock_load_config):
++        mock_load_config.return_value = {
++            "local_server": {"base_url": "http://localhost:11434/v1", "api_key": "local"},
++            "local_models": {"reviewer-1": {"model": "qwen3:32b"}},
++            "meta_reviewer": {"model": "qwen3:32b"},
++        }
++        result = self.runner.invoke(cli, ["config", "show"])
++        assert result.exit_code == 0
++        assert "local_models" in result.output
++        assert "qwen3:32b" in result.output
++
++    # --- list-models --------------------------------------------------------
++
++    @patch('ai_peer_review.cli.get_local_models')
++    def test_list_models(self, mock_get_local_models):
++        mock_get_local_models.return_value = {
++            "reviewer-1": {"model": "qwen3:32b"},
++            "reviewer-2": {"model": "deepseek-r1:70b"},
++        }
++        result = self.runner.invoke(cli, ["list-models"])
+         assert result.exit_code == 0
+-        
+-        # Check that set_api_key was called with the correct arguments
+-        mock_set_api_key.assert_called_once_with("openai", "test-key", None)
+-        
+-        # Check that the output message is correct
+-        assert "API key for openai has been set successfully" in result.output
+-    
+-    @patch('ai_peer_review.review.extract_text_from_pdf')
+-    @patch('ai_peer_review.review.OpenAIClient')
+-    @patch('ai_peer_review.review.AnthropicClient')
+-    def test_review_command_no_meta(self, mock_anthropic, mock_openai, mock_extract_text):
+-        # Mock extract_text_from_pdf to return a dummy text
+-        mock_extract_text.return_value = "Dummy PDF content"
+-        
+-        # Mock the clients to return review content
+-        mock_client = MagicMock()
+-        mock_client.generate.return_value = "Review content"
+-        mock_openai.return_value = mock_client
+-        mock_anthropic.return_value = mock_client
+-            
+-        # Test the review command with --no-meta-review option
++        assert "reviewer-1" in result.output
++        assert "reviewer-2" in result.output
++
++    # --- review -------------------------------------------------------------
++
++    @patch('ai_peer_review.cli.get_available_models', return_value=["reviewer-1", "reviewer-2"])
++    @patch('ai_peer_review.cli.process_paper')
++    def test_review_command_no_meta(self, mock_process_paper, mock_avail):
++        mock_process_paper.return_value = {"reviewer-1": "Review content"}
++
+         with self.runner.isolated_filesystem():
+-            # Create a dummy PDF file
+             with open("test.pdf", "w") as f:
+                 f.write("Dummy PDF content")
+-            
+-            # Run the command
++
+             result = self.runner.invoke(cli, [
+-                "review", 
+-                "test.pdf", 
++                "review", "test.pdf",
+                 "--no-meta-review",
+-                "--models", 
+-                "gpt4-o1,claude-3.7-sonnet"
++                "--models", "reviewer-1",
+             ])
+-            
+-            # Check that the command exited successfully
++
+             assert result.exit_code == 0
+-            
+-            # Check that the output message contains expected information
+             assert "Processing paper: test.pdf" in result.output
+-            assert "Selected models: gpt4-o1, claude-3.7-sonnet" in result.output
+-                
+-            # Check that the output directory "papers/test" was created
++            assert "Selected reviewers: reviewer-1" in result.output
+             assert os.path.exists("papers/test")
+-            
+-            # Check that the meta-review was not generated
++            assert os.path.exists("papers/test/review_reviewer-1.md")
++
++            # No meta-review generated
+             assert "Generating meta-review" not in result.output
+             assert not os.path.exists("papers/test/meta_review.md")
+             assert not os.path.exists("papers/test/results.json")
+-    
+-    @patch('ai_peer_review.review.extract_text_from_pdf')
+-    @patch('ai_peer_review.review.OpenAIClient')
+-    @patch('ai_peer_review.review.AnthropicClient')
+-    @patch('ai_peer_review.review.GoogleClient')
+-    def test_review_command_with_meta(self, mock_google, mock_anthropic, mock_openai, mock_extract_text):
+-        # Mock extract_text_from_pdf to return a dummy text
+-        mock_extract_text.return_value = "Dummy PDF content"
+-        
+-        # Mock the clients to return review content
+-        mock_client = MagicMock()
+-        mock_client.generate.return_value = "Review content"
+-        mock_openai.return_value = mock_client
+-        mock_anthropic.return_value = mock_client
+-        
+-        # Mock the meta-review client
+-        mock_meta_client = MagicMock()
+-        mock_meta_client.generate.return_value = "Meta-review content"
+-        mock_google.return_value = mock_meta_client
+-        
+-        # Test the review command with meta-review option
++
++    @patch('ai_peer_review.cli.get_meta_reviewer_client')
++    @patch('ai_peer_review.cli.get_available_models', return_value=["reviewer-1", "reviewer-2"])
++    @patch('ai_peer_review.cli.generate_meta_review')
++    @patch('ai_peer_review.cli.process_paper')
++    def test_review_command_with_meta(
++        self, mock_process_paper, mock_generate_meta, mock_avail, mock_meta_client
++    ):
++        mock_process_paper.return_value = {"reviewer-1": "Review content"}
++        mock_generate_meta.return_value = (
++            "Meta-review content",
++            {"alfa": "reviewer-1"},
++        )
++        # The concerns-extraction call returns valid JSON
++        mock_meta_instance = MagicMock()
++        mock_meta_instance.generate.return_value = (
++            '{"concerns": [{"concern": "Small sample", "reviewer-1": true}]}'
++        )
++        mock_meta_client.return_value = mock_meta_instance
++
+         with self.runner.isolated_filesystem():
+-            # Create a dummy PDF file
+             with open("test.pdf", "w") as f:
+                 f.write("Dummy PDF content")
+-            
+-            # Run the command
++
+             result = self.runner.invoke(cli, [
+-                "review", 
+-                "test.pdf",
+-                "--models", 
+-                "gpt4-o1,claude-3.7-sonnet"
++                "review", "test.pdf",
++                "--models", "reviewer-1",
+             ])
+-            
+-            # Check that the command exited successfully
++
+             assert result.exit_code == 0
+-            
+-            # Check that the output message contains expected information
+-            assert "Processing paper: test.pdf" in result.output
+-            assert "Selected models: gpt4-o1, claude-3.7-sonnet" in result.output
+             assert "Generating meta-review" in result.output
+-            
+-            # Check that the output directory "papers/test" was created
+-            assert os.path.exists("papers/test")
+-            
+-            # Check that the review files and meta-review files were created
+             assert os.path.exists("papers/test/meta_review.md")
+             assert os.path.exists("papers/test/results.json")
+-            
+-            # Check the content of the results.json file
++            assert os.path.exists("papers/test/concerns_table.csv")
++
+             with open("papers/test/results.json", "r") as f:
+                 results = json.load(f)
+                 assert "individual_reviews" in results
+                 assert "meta_review" in results
+                 assert "reviewer_to_model" in results
+-    
+-    def test_review_command_invalid_models(self):
+-        # Test the review command with invalid models
++
++    @patch('ai_peer_review.cli.get_available_models', return_value=["reviewer-1"])
++    def test_review_command_invalid_models(self, mock_avail):
+         with self.runner.isolated_filesystem():
+-            # Create a dummy PDF file
+             with open("test.pdf", "w") as f:
+                 f.write("Dummy PDF content")
+-            
+-            # Run the command
++
+             result = self.runner.invoke(cli, [
+-                "review", 
+-                "test.pdf", 
+-                "--models", 
+-                "invalid-model1,invalid-model2"
++                "review", "test.pdf",
++                "--models", "invalid-model1,invalid-model2",
+             ])
+-            
+-            # Check that the command exited successfully
++
+             assert result.exit_code == 0
+-            
+-            # Check that the output message contains the expected error
+             assert "No valid models specified" in result.output
+-    
++
+     @patch('ai_peer_review.cli.cli')
+     def test_main(self, mock_cli):
+-        # Test the main function
+         main()
+-        
+-        # Check that cli was called
+-        mock_cli.assert_called_once()
+\ No newline at end of file
++        mock_cli.assert_called_once()
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 88f4826..6593e48 100755
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -125,7 +125,16 @@ class TestConfig:
+         # Check the structure of the default config
+         assert "api_keys" in default_config
+         assert "prompts" in default_config
+-        
++
++        # Local-model sections (added when cloud API clients were replaced)
++        assert "local_server" in default_config
++        assert "base_url" in default_config["local_server"]
++        assert "local_models" in default_config
++        assert isinstance(default_config["local_models"], dict)
++        assert len(default_config["local_models"]) >= 1  # ships a default reviewer
++        assert "meta_reviewer" in default_config
++        assert "model" in default_config["meta_reviewer"]
++
+         # Check that the prompts section contains expected prompts
+         prompts = default_config["prompts"]
+         assert "system" in prompts
+diff --git a/tests/test_review.py b/tests/test_review.py
+index ef5ff1d..2d6de2a 100755
+--- a/tests/test_review.py
++++ b/tests/test_review.py
+@@ -1,12 +1,11 @@
+ import pytest
+ from unittest.mock import patch, MagicMock
+-import random
+ 
+ from ai_peer_review.review import (
+     get_review_prompt,
+     get_metareview_prompt,
+     process_paper,
+-    generate_meta_review
++    generate_meta_review,
+ )
+ 
+ 
+@@ -15,97 +14,108 @@ class TestReview:
+         # Test with a sample paper text
+         paper_text = "This is a sample paper about neuroscience."
+         prompt = get_review_prompt(paper_text)
+-        
++
+         # Check that the prompt contains the paper text
+         assert paper_text in prompt
+-        
++
+         # Check that the prompt contains the required instructions
+         assert "neuroscientist and expert in brain imaging" in prompt
+         assert "provide a thorough and critical review" in prompt
+         assert "summary of the study" in prompt
+         assert "point-by-point analysis" in prompt
+-    
++
+     def test_get_metareview_prompt(self):
+         # Test with sample reviews
+         reviews = ["Review 1 content", "Review 2 content"]
+         prompt = get_metareview_prompt(reviews)
+-        
++
+         # Check that the prompt contains all reviews with NATO names
+         assert "Review from alfa:\n\nReview 1 content" in prompt
+         assert "Review from bravo:\n\nReview 2 content" in prompt
+-        
++
+         # Check that the prompt contains the required instructions
+         assert "meta-review" in prompt
+         assert "common points" in prompt
+         assert "specific concerns" in prompt
+         assert "CONCERNS_TABLE_DATA" in prompt
+-    
++
++    @patch('ai_peer_review.review.get_client_factories')
+     @patch('ai_peer_review.review.extract_text_from_pdf')
+-    @patch('ai_peer_review.review.OpenAIClient')
+-    @patch('ai_peer_review.review.AnthropicClient')
+-    def test_process_paper(self, mock_anthropic, mock_openai, mock_extract_text):
+-        # Mock the extract_text_from_pdf function
++    def test_process_paper(self, mock_extract_text, mock_get_factories):
++        # Mock PDF extraction
+         mock_extract_text.return_value = "Paper content"
+-        
+-        # Mock the LLM clients
+-        mock_openai_instance = MagicMock()
+-        mock_openai_instance.generate.return_value = "OpenAI review"
+-        mock_openai.return_value = mock_openai_instance
+-        
+-        mock_anthropic_instance = MagicMock()
+-        mock_anthropic_instance.generate.return_value = "Anthropic review"
+-        mock_anthropic.return_value = mock_anthropic_instance
+-        
+-        # Test with a subset of models
+-        models = ["gpt4-o1", "claude-3.7-sonnet"]
++
++        # Mock the local client factory so no real server is contacted.
++        # One shared mock client backs both reviewers.
++        mock_client = MagicMock()
++        mock_client.generate.return_value = "Local review"
++        mock_factory = MagicMock(return_value=mock_client)
++        mock_get_factories.return_value = {
++            "reviewer-1": mock_factory,
++            "reviewer-2": mock_factory,
++        }
++
++        # Request a subset of the configured reviewers
++        models = ["reviewer-1", "reviewer-2"]
+         reviews = process_paper("test.pdf", models)
+-        
+-        # Check that the extract_text_from_pdf function was called
++
++        # PDF text extraction ran once
+         mock_extract_text.assert_called_once_with("test.pdf")
+-        
+-        # Check that the OpenAI client was initialized with the correct model
+-        mock_openai.assert_called_once_with(model="gpt-4o")
+-        
+-        # Check that the Anthropic client was initialized with the correct model
+-        mock_anthropic.assert_called_once_with(model="claude-3-sonnet-20240229")
+-        
+-        # Check that the generate methods were called
+-        mock_openai_instance.generate.assert_called_once()
+-        mock_anthropic_instance.generate.assert_called_once()
+-        
+-        # Check that the reviews dictionary contains the expected models
+-        assert set(reviews.keys()) == {"gpt4-o1", "claude-3.7-sonnet"}
+-        assert reviews["gpt4-o1"] == "OpenAI review"
+-        assert reviews["claude-3.7-sonnet"] == "Anthropic review"
+-    
+-    @patch('ai_peer_review.review.GoogleClient')
+-    @patch('ai_peer_review.review.random.shuffle')
+-    def test_generate_meta_review(self, mock_shuffle, mock_google):
+-        # Mock the random.shuffle function to maintain order for predictable testing
+-        mock_shuffle.side_effect = lambda x: x
+-        
+-        # Mock the Google client
+-        mock_google_instance = MagicMock()
+-        mock_google_instance.generate.return_value = "Meta-review content"
+-        mock_google.return_value = mock_google_instance
+-        
++
++        # The factory table was consulted once
++        mock_get_factories.assert_called_once()
++
++        # Each requested reviewer built a client and generated once
++        assert mock_factory.call_count == 2
++        assert mock_client.generate.call_count == 2
++
++        # Results are keyed by reviewer name
++        assert set(reviews.keys()) == {"reviewer-1", "reviewer-2"}
++        assert reviews["reviewer-1"] == "Local review"
++        assert reviews["reviewer-2"] == "Local review"
++
++    @patch('ai_peer_review.review.get_client_factories')
++    @patch('ai_peer_review.review.extract_text_from_pdf')
++    def test_process_paper_filters_unknown_models(self, mock_extract_text, mock_get_factories):
++        # Reviewer names not in the factory table are silently skipped (the
++        # CLI validates against get_available_models first, but process_paper
++        # stays defensive).
++        mock_extract_text.return_value = "Paper content"
++        mock_client = MagicMock()
++        mock_client.generate.return_value = "Local review"
++        mock_get_factories.return_value = {
++            "reviewer-1": MagicMock(return_value=mock_client),
++        }
++
++        reviews = process_paper("test.pdf", ["reviewer-1", "does-not-exist"])
++
++        assert set(reviews.keys()) == {"reviewer-1"}
++        mock_client.generate.assert_called_once()
++
++    @patch('ai_peer_review.review.get_meta_reviewer_client')
++    def test_generate_meta_review(self, mock_get_meta_client):
++        # Mock the configured local meta-reviewer client
++        mock_client = MagicMock()
++        mock_client.generate.return_value = "Meta-review content"
++        mock_get_meta_client.return_value = mock_client
++
+         # Test with sample reviews
+         reviews = {
+-            "model1": "Review 1 content",
+-            "model2": "Review 2 content"
++            "reviewer-1": "Review 1 content",
++            "reviewer-2": "Review 2 content",
+         }
+-        
+-        meta_review, ratings = generate_meta_review(reviews)
+-        
+-        # Check that the Google client was initialized with the correct model
+-        mock_google.assert_called_once_with(model="gemini-2.5-pro-preview-05-06")
+-        
+-        # Check that the generate method was called
+-        mock_google_instance.generate.assert_called_once()
+-        
+-        # Check that the meta_review contains the expected content
++
++        meta_review, mapping = generate_meta_review(reviews)
++
++        # The meta-reviewer client was built once and used once
++        mock_get_meta_client.assert_called_once()
++        mock_client.generate.assert_called_once()
++
++        # The meta-review text is returned verbatim (after stripping the
++        # CONCERNS_TABLE_DATA section, which is absent here)
+         assert meta_review == "Meta-review content"
+-        
+-        # Check that NATO-to-model mapping was created
+-        assert len(ratings) == 2
+-        assert set(ratings.values()) == {"model1", "model2"}
+\ No newline at end of file
++
++        # NATO-to-reviewer mapping was created for every reviewer
++        assert len(mapping) == 2
++        assert set(mapping.values()) == {"reviewer-1", "reviewer-2"}
++        assert set(mapping.keys()) == {"alfa", "bravo"}
